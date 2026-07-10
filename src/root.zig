@@ -30,8 +30,15 @@ const vec_size = blk: {
 /// `vec_size` as unsigned integer type.
 const VectorInt = std.meta.Int(.unsigned, vec_size);
 
-/// HTTP methods
+/// HTTP methods.
+///
+/// Only the nine standard methods below are recognized; extension methods
+/// (PROPFIND, MKCOL, ...) are intentionally rejected by `parseRequest` with
+/// `error.Invalid` — matching known methods as 4-byte magic integers is part
+/// of what makes the parser fast.
 pub const Method = enum(u8) {
+    /// Never produced by the parser; use it as the caller-side initialization
+    /// sentinel (a successful `parseRequest` always overwrites it).
     unknown,
     get,
     post,
@@ -813,7 +820,9 @@ inline fn createCharMap(comptime invalids: anytype) [256]u1 {
 
 /// Parses an HTTP request.
 /// * `error.Incomplete` indicates more data is needed to complete the request.
-/// * `error.Invalid` indicates request is invalid/malformed.
+/// * `error.Invalid` indicates request is invalid/malformed. Note this includes requests
+///   using extension methods (PROPFIND, MKCOL, ...); only the methods in `Method` are
+///   recognized.
 /// * `error.TooManyHeaders` indicates `headers` was too small; retry with a larger slice.
 pub fn parseRequest(
     // Slice we want to parse.
@@ -917,11 +926,11 @@ pub fn parseResponse(
     // Parse status code.
     {
         // Make sure next 3 bytes are numeric (0-9).
-        const dirty = cursor.idx[0] > 47 and cursor.idx[0] < 58 and
+        const all_digits = cursor.idx[0] > 47 and cursor.idx[0] < 58 and
             cursor.idx[1] > 47 and cursor.idx[1] < 58 and
             cursor.idx[2] > 47 and cursor.idx[2] < 58;
 
-        if (!dirty) {
+        if (!all_digits) {
             @branchHint(.unlikely);
             return error.Invalid;
         }

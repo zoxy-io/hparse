@@ -90,12 +90,15 @@ distinguish "headers array too small" (retryable) from "malformed" (fatal).
 
 **Fix:** add the error variant, or correct the comment.
 
-## Nits
+## Nits — ✅ all done
 - ~~`parseResponse` uses inferred `!usize`; `parseRequest` uses explicit
   `ParseRequestError!usize` — make consistent.~~ ✅ Done (now `ParseRequestError!usize`).
-- `parseResponse` status-code local `dirty` means "valid/all-digits" — confusing inverse.
-- Non-standard methods (PROPFIND, MKCOL, …) return `error.Invalid`; document as intentional.
-- `Method.unknown` is never produced by the parser (caller-init sentinel only) — document.
+- ~~`parseResponse` status-code local `dirty` means "valid/all-digits" — confusing
+  inverse.~~ ✅ Done (renamed to `all_digits`).
+- ~~Non-standard methods (PROPFIND, MKCOL, …) return `error.Invalid`; document as
+  intentional.~~ ✅ Done (documented on `Method` and in `parseRequest`'s doc comment).
+- ~~`Method.unknown` is never produced by the parser (caller-init sentinel only) —
+  document.~~ ✅ Done (doc comment on the enum field).
 
 ## What's already good
 - Endianness-correct (magic constants and `asInteger` both `@bitCast`).
