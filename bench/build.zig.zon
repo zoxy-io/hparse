@@ -1,0 +1,16 @@
+.{
+    .name = .hparse_benchmarks,
+    .version = "0.0.0",
+    .fingerprint = 0x8d07e5493f56a3d6,
+    .dependencies = .{
+        .hparse = .{ .path = ".." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "hparse/src",
+        "headparser/src",
+        "picohttpparser",
+        "runner",
+    },
+}
