@@ -31,8 +31,13 @@ pub fn build(b: *std.Build) void {
     }).module("hparse");
 
     // hparse benchmark (Zig).
+    //
+    // use_llvm matters: Zig 0.16's default self-hosted x86_64 backend scalarizes
+    // @Vector compares, making hparse ~11x slower. The C parser always goes through
+    // clang/LLVM, so without this flag the comparison is meaningless.
     const hparse_bench = b.addExecutable(.{
         .name = "hparse",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("hparse/src/main.zig"),
             .target = target,
@@ -47,6 +52,7 @@ pub fn build(b: *std.Build) void {
     // std.http.Server.Request.Head benchmark (Zig).
     const headparser_bench = b.addExecutable(.{
         .name = "headparser",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("headparser/src/main.zig"),
             .target = target,
