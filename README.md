@@ -17,39 +17,31 @@ Fast HTTP/1.1 & HTTP/1.0 parser. Powered by Zig ⚡
 
 ## Are We Fast?
 
-Benchmarks can be found under [`bench/`](https://github.com/zoxy-io/hparse/tree/main/bench) folder, they can either be run with [hyperfine](https://github.com/sharkdp/hyperfine) or [POOP](https://github.com/andrewrk/poop).
+Benchmarks live under [`bench/`](https://github.com/zoxy-io/hparse/tree/main/bench) and run entirely through the Zig build system — no shell scripts, Makefiles or external benchmark tools required:
 
-Here are the comparison of 3 parser libraries (hparse, httparse and picohttpparser) via POOP.
+```sh
+cd bench
+zig build bench                # 1M parses per run, 5 runs per parser
+zig build bench -Druns=10      # more repetitions
+zig build bench -Diters=10000000  # heavier workload per run
+```
+
+This builds and compares three parsers on the same request workload: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`) and **picohttpparser** (compiled from C by Zig's bundled clang).
+
+Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run:
 
 ```
-Benchmark 1 (35 runs): ./picohttpparser/picohttpparser
-  measurement          mean ± σ            min … max           outliers         delta
-  wall_time          1.45s  ± 8.78ms    1.44s  … 1.49s           1 ( 3%)        0%
-  peak_rss           1.20MB ± 11.0KB    1.14MB … 1.20MB          1 ( 3%)        0%
-  cpu_cycles         6.16G  ± 30.3M     6.13G  … 6.30G           2 ( 6%)        0%
-  instructions       34.7G  ±  141      34.7G  … 34.7G           1 ( 3%)        0%
-  cache_references   11.1K  ± 3.30K     7.47K  … 20.5K           1 ( 3%)        0%
-  cache_misses       6.08K  ± 1.14K     3.71K  … 9.26K           2 ( 6%)        0%
-  branch_misses      13.2K  ± 3.16K     10.0K  … 24.1K           3 ( 9%)        0%
-Benchmark 2 (33 runs): ./bench-httparse/target/release/bench-httparse
-  measurement          mean ± σ            min … max           outliers         delta
-  wall_time          1.54s  ± 33.8ms    1.51s  … 1.66s           1 ( 3%)        💩+  5.9% ±  0.8%
-  peak_rss           1.86MB ± 28.2KB    1.79MB … 1.92MB         12 (36%)        💩+ 54.6% ±  0.9%
-  cpu_cycles         6.53G  ±  140M     6.43G  … 7.03G           1 ( 3%)        💩+  6.1% ±  0.8%
-  instructions       25.2G  ±  294      25.2G  … 25.2G           0 ( 0%)        ⚡- 27.4% ±  0.0%
-  cache_references   17.0K  ± 3.58K     12.5K  … 26.9K           2 ( 6%)        💩+ 53.8% ± 15.1%
-  cache_misses       9.16K  ± 1.58K     6.95K  … 14.0K           2 ( 6%)        💩+ 50.7% ± 11.0%
-  branch_misses      12.4K  ± 1.23K     10.4K  … 15.4K           0 ( 0%)          -  5.9% ±  8.9%
-Benchmark 3 (40 runs): ./hparse/zig-out/bin/hparse
-  measurement          mean ± σ            min … max           outliers         delta
-  wall_time          1.27s  ± 4.63ms    1.26s  … 1.28s           0 ( 0%)        ⚡- 12.5% ±  0.2%
-  peak_rss            184KB ±    0       184KB …  184KB          0 ( 0%)        ⚡- 84.6% ±  0.3%
-  cpu_cycles         5.38G  ± 1.81M     5.38G  … 5.39G           3 ( 8%)        ⚡- 12.6% ±  0.2%
-  instructions       8.01G  ±  164      8.01G  … 8.01G           0 ( 0%)        ⚡- 76.9% ±  0.0%
-  cache_references   1.87K  ± 1.24K      617   … 5.91K           3 ( 8%)        ⚡- 83.1% ± 10.1%
-  cache_misses       1.08K  ±  735       469   … 3.45K           6 (15%)        ⚡- 82.2% ±  7.2%
-  branch_misses      6.51K  ±  776      5.36K  … 8.71K           4 (10%)        ⚡- 50.6% ±  7.8%
+name                    min       mean        max      rel
+----------------------------------------------------------
+picohttpparser       0.199s     0.201s     0.206s    1.00x
+hparse               0.429s     0.441s     0.450s    2.15x
+std.http             6.131s     6.407s     6.844s   30.82x
 ```
+
+Closing the remaining gap to picohttpparser on current Zig is ongoing work. For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
+
+> [!IMPORTANT]
+> **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~11x slower. The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
 
 ## Usage
 
@@ -84,6 +76,16 @@ const hparse_dep = b.dependency("hparse", dep_opts);
 const hparse_module = hparse_dep.module("hparse");
 
 exe_mod.addImport("hparse", hparse_module);
+```
+
+For fast parsing in release builds on x86_64, force the LLVM backend on the executable that links hparse — Zig 0.16's default self-hosted backend does not vectorize `@Vector` code yet:
+
+```zig
+const exe = b.addExecutable(.{
+    .name = "my-app",
+    .use_llvm = true, // hparse relies on SIMD; ~11x faster than the self-hosted backend
+    .root_module = exe_mod,
+});
 ```
 
 ## Acknowledgements
