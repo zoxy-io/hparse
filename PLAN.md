@@ -55,7 +55,15 @@ Whitespace in a field name is malformed (RFC 7230 §3.2.4) and a smuggling vecto
 
 **Fix:** add `' '` to `key_map`'s invalid set so the scalar fallback rejects, matching SIMD.
 
-## 🟡 Low — header-value OWS / HTAB handling diverges from RFC 7230
+## 🟡 Low — header-value OWS / HTAB handling diverges from RFC 7230 — ✅ FIXED
+
+> Fixed: TAB (0x09) is now a legal value char (`value_map`, SIMD and SWAR matchers), and
+> leading + trailing OWS (SP / HTAB) is trimmed in `parseHeader`. The SWAR path skips TAB
+> *after* stopping (the less-than trick's borrow makes masking TAB out unsafe — a genuine
+> `<32` byte perturbs the next byte's high bit). Regression test: "OWS/HTAB handling in
+> header values (RFC 7230)" covers leading/trailing/internal TAB on scalar, SWAR and SIMD
+> paths plus a tab-only value trimming to empty.
+
 
 - Only leading `' '` is skipped (~line 531), not HTAB; trailing OWS is not trimmed.
   (`"Host: localhost   "` → value `"localhost   "`.)
@@ -65,7 +73,16 @@ Whitespace in a field name is malformed (RFC 7230 §3.2.4) and a smuggling vecto
 
 **Fix:** decide policy and document, or trim leading/trailing SP+HTAB and allow internal HTAB.
 
-## 🟡 Low — `parseHeaders` doc/behavior mismatch on overflow
+## 🟡 Low — `parseHeaders` doc/behavior mismatch on overflow — ✅ FIXED
+
+> Fixed by making the code match the promise: added `TooManyHeaders` to `ParseRequestError`.
+> When the `headers` slice fills and the next byte is a valid header-key character (another
+> header follows), `parseHeaders` returns `error.TooManyHeaders`; genuinely malformed bytes
+> still return `error.Invalid`. Public doc comments on `parseRequest`/`parseResponse`
+> updated, and `parseResponse` now uses the explicit `ParseRequestError!usize` return type.
+> Regression test: "full headers slice with more headers returns TooManyHeaders" (also
+> confirms a larger slice parses the same request cleanly).
+
 
 Comment promises `error.TooManyHeaders`, but `ParseRequestError` is only
 `{Incomplete, Invalid}` and overflow returns `error.Invalid` (~line 637). Callers can't
@@ -74,8 +91,8 @@ distinguish "headers array too small" (retryable) from "malformed" (fatal).
 **Fix:** add the error variant, or correct the comment.
 
 ## Nits
-- `parseResponse` uses inferred `!usize`; `parseRequest` uses explicit
-  `ParseRequestError!usize` — make consistent.
+- ~~`parseResponse` uses inferred `!usize`; `parseRequest` uses explicit
+  `ParseRequestError!usize` — make consistent.~~ ✅ Done (now `ParseRequestError!usize`).
 - `parseResponse` status-code local `dirty` means "valid/all-digits" — confusing inverse.
 - Non-standard methods (PROPFIND, MKCOL, …) return `error.Invalid`; document as intentional.
 - `Method.unknown` is never produced by the parser (caller-init sentinel only) — document.

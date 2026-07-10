@@ -73,9 +73,11 @@ const HTTP_1_1: u64 = @bitCast([8]u8{ 'H', 'T', 'T', 'P', '/', '1', '.', '1' });
 /// `GET / HTTP/1.1\n`
 const min_request_len = 0xf;
 
-/// When `error.Incomplete` is received, caller should read more bytes to buffer
-/// and retry parsing with `parseRequest`.
-pub const ParseRequestError = error{ Incomplete, Invalid };
+/// * `error.Incomplete` — caller should read more bytes into the buffer and retry.
+/// * `error.Invalid` — the request/response is malformed.
+/// * `error.TooManyHeaders` — the provided `headers` slice was too small; caller can
+///   retry with a larger slice.
+pub const ParseRequestError = error{ Incomplete, Invalid, TooManyHeaders };
 
 /// Helper for wandering around & parsing things along the way.
 const Cursor = struct {
@@ -439,7 +441,7 @@ const Cursor = struct {
         if (comptime use_vectors) {
             while (cursor.hasLength(vec_size)) {
                 // Fill a vector with TAB (\t, 9).
-                //const tabs: @Vector(vec_size, u8) = @splat(0x9);
+                const tabs: @Vector(vec_size, u8) = @splat(0x9);
                 // Fill a vector with DEL (127).
                 const deletes: @Vector(vec_size, u8) = @splat(0x7f);
                 // Fill a vector with US (31).
@@ -447,8 +449,10 @@ const Cursor = struct {
                 // Load the next chunk from the buffer.
                 const chunk = cursor.asVector(vec_size);
 
-                //const bits = @intFromBool(chunk > full_31) | @intFromBool(chunk == tabs) & ~@intFromBool(chunk == deletes);
-                const bits = @intFromBool(chunk > full_31) & ~@intFromBool(chunk == deletes);
+                // A byte is a valid value char if it's greater than US (31) OR is a TAB,
+                // and isn't DEL (127). TAB is allowed since it's legal inside field values
+                // (RFC 7230 field-content permits SP / HTAB between field-vchars).
+                const bits = (@intFromBool(chunk > full_31) | @intFromBool(chunk == tabs)) & ~@intFromBool(chunk == deletes);
 
                 const adv_by = @ctz(~@as(VectorInt, @bitCast(bits)));
 
@@ -480,8 +484,17 @@ const Cursor = struct {
 
             cursor.advance(adv_by);
 
-            // chunk includes an invalid char or space, we're done
+            // chunk includes a control char, CRLF or DEL, we've stopped on it.
             if (adv_by != block_size) {
+                // TAB (9) is a legal value char. We can't mask it out of the less-than
+                // detection above — the borrow from a genuine < 32 byte perturbs the next
+                // byte's high bit — so instead we handle it here: skip the TAB and keep
+                // scanning. `@ctz` gives the *first* stop, so we always land on the TAB
+                // itself before any borrow-induced false positive after it.
+                if (cursor.char() == '\t') {
+                    cursor.advance(1);
+                    continue;
+                }
                 return;
             }
         }
@@ -525,8 +538,8 @@ const Cursor = struct {
             else => return error.Invalid,
         }
 
-        // Get rid of leading spaces if there are any.
-        while (cursor.end - cursor.current() > 0 and cursor.char() == ' ') : (cursor.advance(1)) {}
+        // Trim leading optional whitespace (OWS = SP / HTAB) per RFC 7230.
+        while (cursor.end - cursor.current() > 0 and (cursor.char() == ' ' or cursor.char() == '\t')) : (cursor.advance(1)) {}
 
         // Found where header value starts.
         const val_start = cursor.current();
@@ -563,15 +576,24 @@ const Cursor = struct {
             else => return error.Invalid,
         }
 
+        // Trim trailing optional whitespace (OWS = SP / HTAB) per RFC 7230
+        // (field-value = OWS field-content OWS). The cursor already sits on the terminator;
+        // we only shrink the recorded slice.
+        var value = val_start[0 .. val_end - val_start];
+        while (value.len > 0 and (value[value.len - 1] == ' ' or value[value.len - 1] == '\t')) {
+            value.len -= 1;
+        }
+
         // Header is set.
         header.* = .{
             .key = key_start[0 .. key_end - key_start],
-            .value = val_start[0 .. val_end - val_start],
+            .value = value,
         };
     }
 
     /// Parses HTTP request headers.
-    /// If the provided `Headers` length is not sufficient, it returns `error.TooManyHeaders`.
+    /// If the `headers` slice fills up before the terminating CRLF and another header
+    /// follows, returns `error.TooManyHeaders` so the caller can retry with a larger slice.
     inline fn parseHeaders(cursor: *Cursor, headers: []Header, count: *usize) ParseRequestError!void {
         var i: usize = 0;
         while (i < headers.len) : (i += 1) {
@@ -639,11 +661,12 @@ const Cursor = struct {
                 cursor.advance(1);
             },
             else => {
-                // If we got here, we either;
-                // * have too many headers and not enough space in `headers`,
-                // * or just received an invalid character.
-                //
-                // NOTE: Currently either possibilities are interpreted as `error.Invalid`, this might change in the future.
+                // The `headers` slice is full and the next byte isn't the terminating CRLF.
+                // If it's a valid header-key character, another header follows and the caller
+                // needs a larger `headers` slice; otherwise the request is malformed.
+                if (isValidKeyChar(cursor.char())) {
+                    return error.TooManyHeaders;
+                }
                 return error.Invalid;
             },
         }
@@ -730,9 +753,12 @@ inline fn isValidKeyChar(c: u8) bool {
 }
 
 /// Table of valid header value characters.
+///
+/// NOTE: TAB (0x09) is intentionally *not* listed as invalid — it's a legal character
+/// inside field values (RFC 7230). Leading/trailing TAB is trimmed as OWS in `parseHeader`.
 const value_map = createCharMap(.{
-    // Invalid characters.
-    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,  16,
+    // Invalid characters (control chars except TAB, plus DEL).
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  10, 11, 12, 13, 14, 15, 16,
     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127,
 });
 
@@ -788,6 +814,7 @@ inline fn createCharMap(comptime invalids: anytype) [256]u1 {
 /// Parses an HTTP request.
 /// * `error.Incomplete` indicates more data is needed to complete the request.
 /// * `error.Invalid` indicates request is invalid/malformed.
+/// * `error.TooManyHeaders` indicates `headers` was too small; retry with a larger slice.
 pub fn parseRequest(
     // Slice we want to parse.
     slice: []const u8,
@@ -836,8 +863,9 @@ pub fn parseRequest(
 const min_res_len = 13;
 
 /// Parses an HTTP response.
-/// * `error.Incomplete` indicates more data is needed to complete the request.
-/// * `error.Invalid` indicates request is invalid/malformed.
+/// * `error.Incomplete` indicates more data is needed to complete the response.
+/// * `error.Invalid` indicates response is invalid/malformed.
+/// * `error.TooManyHeaders` indicates `headers` was too small; retry with a larger slice.
 pub fn parseResponse(
     // Slice we want to parse.
     slice: []const u8,
@@ -851,7 +879,7 @@ pub fn parseResponse(
     headers: []Header,
     /// Count of parsed headers will be set here.
     header_count: *usize,
-) !usize {
+) ParseRequestError!usize {
     // We need at least `min_res_len` bytes to start parsing.
     if (slice.len < min_res_len) {
         return error.Incomplete;
@@ -1209,4 +1237,53 @@ test "parseResponse: truncated status/headers return Incomplete" {
             parseResponse(res, &version, &status_code, &status_msg, &headers, &header_count),
         );
     }
+}
+
+test "parseRequest: OWS/HTAB handling in header values (RFC 7230)" {
+    const Case = struct { req: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        // leading HTAB after the colon is trimmed
+        .{ .req = "GET / HTTP/1.1\r\nHost:\tlocalhost\r\n\r\n", .expected = "localhost" },
+        // trailing SP + HTAB are trimmed
+        .{ .req = "GET / HTTP/1.1\r\nHost: localhost \t \r\n\r\n", .expected = "localhost" },
+        // internal HTAB is preserved (scalar path, short value)
+        .{ .req = "GET / HTTP/1.1\r\nX: a\tb\r\n\r\n", .expected = "a\tb" },
+        // internal HTAB is preserved (SIMD path, long value)
+        .{ .req = "GET / HTTP/1.1\r\nX: aaaaaaaa\tbbbbbbbbbbbb\r\n\r\n", .expected = "aaaaaaaa\tbbbbbbbbbbbb" },
+    };
+
+    for (cases) |c| {
+        var method: Method = .unknown;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        _ = try parseRequest(c.req, &method, &path, &version, &headers, &header_count);
+        try testing.expect(header_count == 1);
+        try testing.expectEqualStrings(c.expected, headers[0].value);
+    }
+}
+
+test "parseRequest: full headers slice with more headers returns TooManyHeaders" {
+    // Three headers but room for only two: the caller should be told to grow the slice
+    // rather than getting an indistinguishable error.Invalid.
+    const req = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n";
+
+    var method: Method = .unknown;
+    var path: ?[]const u8 = null;
+    var version: Version = .@"1.0";
+    var headers: [2]Header = undefined;
+    var header_count: usize = 0;
+
+    try testing.expectError(
+        error.TooManyHeaders,
+        parseRequest(req, &method, &path, &version, &headers, &header_count),
+    );
+
+    // With a large enough slice the same request parses cleanly.
+    var big: [8]Header = undefined;
+    const len = try parseRequest(req, &method, &path, &version, &big, &header_count);
+    try testing.expect(len == req.len);
+    try testing.expect(header_count == 3);
 }
