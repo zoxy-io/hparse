@@ -1,9 +1,9 @@
 # hparse
 
-![GitHub License](https://img.shields.io/github/license/nikneym/hparse?color=orange)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/nikneym/hparse/test-x86_64-linux.yml?label=x86_64-linux)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/nikneym/hparse/test-x86_64-windows.yml?label=x86_64-windows)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/nikneym/hparse/test-macos.yml?label=macos)
+![GitHub License](https://img.shields.io/github/license/zoxy-io/hparse?color=orange)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/hparse/test-x86_64-linux.yml?label=x86_64-linux)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/hparse/test-x86_64-windows.yml?label=x86_64-windows)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/hparse/test-macos.yml?label=macos)
 
 Fast HTTP/1.1 & HTTP/1.0 parser. Powered by Zig ⚡
 
@@ -19,9 +19,7 @@ Fast HTTP/1.1 & HTTP/1.0 parser. Powered by Zig ⚡
 
 Benchmarks can be found under [`bench/`](https://github.com/nikneym/hparse/tree/main/bench) folder, they can either be run with [hyperfine](https://github.com/sharkdp/hyperfine) or [POOP](https://github.com/andrewrk/poop).
 
-Here are the comparison of 3 parser libraries (hparse, httparse and picohttpparser) via POOP, visualized by Claude 4 Sonnet.
-
-<img src="./bench/bench.svg">
+Here are the comparison of 3 parser libraries (hparse, httparse and picohttpparser) via POOP.
 
 ```
 Benchmark 1 (35 runs): ./picohttpparser/picohttpparser
