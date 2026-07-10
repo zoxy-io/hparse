@@ -102,3 +102,31 @@ distinguish "headers array too small" (retryable) from "malformed" (fatal).
 - SWAR less-than/DEL detection is correct; path and value matching are consistent across
   SIMD/SWAR/scalar — only the key path has the space discrepancy above.
 - Tests pass on Zig 0.16; CI covers Linux/macOS/Windows.
+
+## Benchmark status (2026-07-10)
+
+Rebuilt as a pure-Zig harness (`bench/`, `zig build bench` — no Makefile/shell/cargo);
+compares hparse, `std.http.Server.Request.Head.parse` and picohttpparser (upstream
+`f4d94b48`, C compiled by Zig's clang, Zig driver via extern decls).
+
+Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, ReleaseFast + LLVM backend, 1M parses/run:
+
+```
+name                    min       mean        max      rel
+----------------------------------------------------------
+hparse               0.104s     0.112s     0.117s    1.00x
+picohttpparser       0.128s     0.130s     0.134s    1.23x
+std.http             0.697s     0.707s     0.721s    6.70x
+```
+
+hparse leads (~104 ns/parse), consistent with the project's original claims. Outputs are
+consumed via `doNotOptimizeAway` in the Zig drivers, so LLVM can't elide work the extern
+C call is forced to do (verified: no elision occurs; numbers hold either way).
+
+Two perf footguns found while redoing these — both worth remembering:
+- **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** → hparse
+  ~11x slower (no `vpcmpgtb`/`vpmovmskb` emitted). Bench forces `use_llvm = true`;
+  README tells library consumers to do the same in release builds.
+- **`standardOptimizeOption(.{ .preferred_optimize_mode = ... })` still yields Debug**
+  unless `-Drelease` is passed — the harness previously ran everything in Debug (C got
+  `-O0` + UBSan + stack protector). ReleaseFast is now hardcoded in `bench/build.zig`.
