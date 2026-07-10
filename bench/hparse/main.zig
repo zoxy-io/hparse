@@ -13,7 +13,7 @@ pub fn main() !void {
         var headers: [32]hparse.Header = undefined;
         var header_count: usize = 0;
 
-        _ = try hparse.parseRequest(
+        const consumed = try hparse.parseRequest(
             buffer[0..],
             &method,
             &path,
@@ -21,5 +21,14 @@ pub fn main() !void {
             &headers,
             &header_count,
         );
+
+        // hparse compiles in the same compilation unit as this driver, so without
+        // consuming the outputs LLVM dead-code-eliminates parts of the parse. The
+        // extern picohttpparser call can't be elided, so eliding here would skew
+        // the comparison in hparse's favor.
+        std.mem.doNotOptimizeAway(consumed);
+        std.mem.doNotOptimizeAway(header_count);
+        std.mem.doNotOptimizeAway(&headers);
+        std.mem.doNotOptimizeAway(path);
     }
 }

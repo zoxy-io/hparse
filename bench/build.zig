@@ -11,8 +11,11 @@ const std = @import("std");
 // whole flow lives inside `zig build`, no shell or Makefile.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // Benchmarks are meaningless in Debug; default to ReleaseFast.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // Benchmarks are meaningless in Debug, so ReleaseFast is hardcoded rather than
+    // offered as an option. Note standardOptimizeOption's preferred_optimize_mode
+    // does NOT do this: it still yields Debug unless -Drelease is passed, which
+    // silently compiled the C parser with -O0 + UBSan + stack protector.
+    const optimize: std.builtin.OptimizeMode = .ReleaseFast;
 
     const runs = b.option(usize, "runs", "Repetitions per benchmark (default 5)") orelse 5;
     const iters = b.option(usize, "iters", "Parse iterations per benchmark run (default 1_000_000)") orelse 1_000_000;
@@ -39,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .name = "hparse",
         .use_llvm = true,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("hparse/src/main.zig"),
+            .root_source_file = b.path("hparse/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -54,26 +57,29 @@ pub fn build(b: *std.Build) void {
         .name = "headparser",
         .use_llvm = true,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("headparser/src/main.zig"),
+            .root_source_file = b.path("headparser/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "bench_options", .module = options_module }},
         }),
     });
 
-    // picohttpparser benchmark (C), compiled by `zig cc` — no gcc/make needed.
+    // picohttpparser benchmark: Zig driver + the C parser compiled by Zig's bundled
+    // clang — no gcc/make needed.
     const pico_mod = b.createModule(.{
+        .root_source_file = b.path("picohttpparser/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{.{ .name = "bench_options", .module = options_module }},
     });
     pico_mod.addCSourceFiles(.{
-        .files = &.{ "picohttpparser/main.c", "picohttpparser/picohttpparser.c" },
-        .flags = &.{ "-O3", b.fmt("-DITERS={d}", .{iters}) },
+        .files = &.{"picohttpparser/picohttpparser.c"},
+        .flags = &.{"-O3"},
     });
-    pico_mod.addIncludePath(b.path("picohttpparser"));
     const pico_bench = b.addExecutable(.{
         .name = "picohttpparser",
+        .use_llvm = true,
         .root_module = pico_mod,
     });
 

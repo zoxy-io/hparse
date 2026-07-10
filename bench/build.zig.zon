@@ -8,8 +8,8 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "hparse/src",
-        "headparser/src",
+        "hparse",
+        "headparser",
         "picohttpparser",
         "runner",
     },

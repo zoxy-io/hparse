@@ -7,6 +7,9 @@ pub fn main() !void {
 
     var i: usize = 0;
     while (i < iters) : (i += 1) {
-        _ = try Head.parse(buffer);
+        const head = try Head.parse(buffer);
+        // Same compilation unit as the parser — consume the result so LLVM can't
+        // elide parts of the parse (see hparse/main.zig).
+        std.mem.doNotOptimizeAway(head);
     }
 }

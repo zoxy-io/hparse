@@ -33,12 +33,12 @@ Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per 
 ```
 name                    min       mean        max      rel
 ----------------------------------------------------------
-picohttpparser       0.199s     0.201s     0.206s    1.00x
-hparse               0.429s     0.441s     0.450s    2.15x
-std.http             6.131s     6.407s     6.844s   30.82x
+hparse               0.104s     0.112s     0.117s    1.00x
+picohttpparser       0.128s     0.130s     0.134s    1.23x
+std.http             0.697s     0.707s     0.721s    6.70x
 ```
 
-Closing the remaining gap to picohttpparser on current Zig is ongoing work. For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
+For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
 
 > [!IMPORTANT]
 > **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~11x slower. The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
