@@ -17,7 +17,7 @@ Fast HTTP/1.1 & HTTP/1.0 parser. Powered by Zig ⚡
 
 ## Are We Fast?
 
-Benchmarks can be found under [`bench/`](https://github.com/nikneym/hparse/tree/main/bench) folder, they can either be run with [hyperfine](https://github.com/sharkdp/hyperfine) or [POOP](https://github.com/andrewrk/poop).
+Benchmarks can be found under [`bench/`](https://github.com/zoxy-io/hparse/tree/main/bench) folder, they can either be run with [hyperfine](https://github.com/sharkdp/hyperfine) or [POOP](https://github.com/andrewrk/poop).
 
 Here are the comparison of 3 parser libraries (hparse, httparse and picohttpparser) via POOP.
 
@@ -72,7 +72,7 @@ _ = try hparse.parseRequest(buffer[0..], &method, &path, &http_version, &headers
 Install via Zig package manager (Copy the full SHA of latest commit hash from GitHub):
 
 ```sh
-zig fetch --save https://github.com/nikneym/hparse/archive/<latest-commit-hash>.tar.gz
+zig fetch --save https://github.com/zoxy-io/hparse/archive/<latest-commit-hash>.tar.gz
 ```
 
 In your `build` function at `build.zig`, make sure your build step and source files are aware of the module:
