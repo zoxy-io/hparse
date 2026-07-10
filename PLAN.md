@@ -3,7 +3,14 @@
 Review of `src/root.zig` (zero-alloc streaming HTTP/1.x parser). Each item below was
 reproduced against the current code. Ordered by severity.
 
-## 🔴 High — out-of-bounds read one byte past the slice on truncated input
+## 🔴 High — out-of-bounds read one byte past the slice on truncated input — ✅ FIXED
+
+> Fixed: end-of-buffer guards added before every `cursor.char()` that follows a
+> match/advance (`parsePath`, `parseHeader` key+value, `parseHeaders` loop head + post-loop
+> CRLF, `parseStatusMessage`). Regression tests: "does not read past slice end (OOB
+> regression)", "truncated inputs return Incomplete", "parseResponse: truncated
+> status/headers return Incomplete".
+
 
 Every `matchX()` loop stops when `cursor.idx == cursor.end`, but the caller reads
 `cursor.char()` (`cursor.idx[0]`) **before** checking for end-of-buffer. `idx` is a
@@ -31,7 +38,12 @@ contradicts the "handles partial requests / streaming first" guarantee.
 `charOrNull`). The `parseHeaders` loop head needs the same guard. Add a regression test
 for truncated input (slice shorter than backing array).
 
-## 🟠 Medium — space in header key: SIMD and scalar paths disagree
+## 🟠 Medium — space in header key: SIMD and scalar paths disagree — ✅ FIXED
+
+> Fixed: added `' '` to `key_map`'s invalid set so the scalar fallback rejects space like
+> the SIMD path. Regression test: "space in header key is rejected regardless of match
+> path" (covers both the short/scalar and long/SIMD tails).
+
 
 `key_map` invalid set is `0..31, ':', 127` — **space (0x20) is missing**, so
 `isValidKeyChar(' ')` is `true`. The SIMD path (`chunk > spaces`, ~line 411) *excludes*

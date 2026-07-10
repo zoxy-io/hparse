@@ -318,6 +318,13 @@ const Cursor = struct {
         // after `matchPath` returns, we're at where path ends
         const path_end = cursor.current();
 
+        // If `matchPath` consumed the whole buffer, we reached the end before finding the
+        // delimiter. Check this *before* dereferencing so we never read past the end; the
+        // caller can read more data and retry.
+        if (path_end == cursor.end) {
+            return error.Incomplete;
+        }
+
         // Make sure the char caused `matchPath` to return is a space.
         if (cursor.char() == ' ') {
             @branchHint(.likely); // likely go down here
@@ -331,15 +338,8 @@ const Cursor = struct {
             return;
         }
 
-        // If we got here we've either;
-        // * Found an invalid character that's not space (32),
-        // * Reached end of the buffer so this is likely a partial request.
-        if (path_end == cursor.end) {
-            // No remaining bytes, though the caller can read more data and try to parse again.
-            return error.Incomplete;
-        }
-
-        // Invalid character and not end of the buffer, so a malformed request. Can't go further.
+        // Invalid character that's not a space (32) and not the end of the buffer, so a
+        // malformed request. Can't go further.
         return error.Invalid;
     }
 
@@ -500,6 +500,13 @@ const Cursor = struct {
         cursor.matchHeaderKey();
         const key_end = cursor.current();
 
+        // If `matchHeaderKey` consumed the whole buffer, we reached the end before finding
+        // the delimiter. Check before dereferencing so we never read past the end; the
+        // caller can read more data and retry.
+        if (key_end == cursor.end) {
+            return error.Incomplete;
+        }
+
         // Make sure the invalid character is a colon (58).
         switch (cursor.char()) {
             ':' => {
@@ -513,18 +520,9 @@ const Cursor = struct {
                 // move forward
                 cursor.advance(1);
             },
-            else => {
-                // If we got here we've either;
-                // * Found an invalid character that's not colon (58),
-                // * Reached end of the buffer so this is likely a partial request.
-                if (key_end == cursor.end) {
-                    // No remaining bytes, though the caller can read more data and try to parse again.
-                    return error.Incomplete;
-                }
-
-                // Invalid character and not end of the buffer, so a malformed request. Can't go further.
-                return error.Invalid;
-            },
+            // Any character that's not a colon (58), and not the end of the buffer, so a
+            // malformed request. Can't go further.
+            else => return error.Invalid,
         }
 
         // Get rid of leading spaces if there are any.
@@ -534,6 +532,12 @@ const Cursor = struct {
         const val_start = cursor.current();
         cursor.matchHeaderValue();
         const val_end = cursor.current();
+
+        // Same as the key above: if the value ran to the end of the buffer we need more
+        // bytes to find its terminator. Check before dereferencing.
+        if (val_end == cursor.end) {
+            return error.Incomplete;
+        }
 
         switch (cursor.char()) {
             // Both `\n` and `\r\n` indicate the end of value part.
@@ -556,14 +560,7 @@ const Cursor = struct {
                 cursor.advance(1);
             },
             // Any other character is invalid.
-            else => {
-                if (val_end == cursor.end) {
-                    return error.Incomplete;
-                }
-
-                // Invalid character and not end of the buffer, so a malformed request. Can't go further.
-                return error.Invalid;
-            },
+            else => return error.Invalid,
         }
 
         // Header is set.
@@ -578,6 +575,13 @@ const Cursor = struct {
     inline fn parseHeaders(cursor: *Cursor, headers: []Header, count: *usize) ParseRequestError!void {
         var i: usize = 0;
         while (i < headers.len) : (i += 1) {
+            // We need at least one byte to tell whether the header section has ended or
+            // another header follows. Guard before dereferencing so we never read past the
+            // end on a truncated request.
+            if (cursor.current() == cursor.end) {
+                return error.Incomplete;
+            }
+
             // check if headers part has finished
             switch (cursor.char()) {
                 '\n' => {
@@ -610,6 +614,12 @@ const Cursor = struct {
 
         // Set count to highest.
         count.* = i;
+
+        // The `headers` slice is full; we still need the terminating CRLF. Guard before
+        // dereferencing so we never read past the end.
+        if (cursor.current() == cursor.end) {
+            return error.Incomplete;
+        }
 
         // We have to check for ending CRLF, same as what we're doing at top.
         switch (cursor.char()) {
@@ -654,6 +664,12 @@ const Cursor = struct {
         cursor.matchStatusMessage();
         const msg_end = cursor.current();
 
+        // If `matchStatusMessage` consumed the whole buffer, we reached the end before the
+        // terminator. Check before dereferencing so we never read past the end.
+        if (msg_end == cursor.end) {
+            return error.Incomplete;
+        }
+
         // The character that cause `matchStatusMessage` must be either `\r` or `\n`.
         switch (cursor.char()) {
             '\n' => {
@@ -677,13 +693,7 @@ const Cursor = struct {
                 // done
                 cursor.advance(1);
             },
-            else => {
-                if (msg_end == cursor.end) {
-                    return error.Incomplete;
-                }
-
-                return error.Invalid;
-            },
+            else => return error.Invalid,
         }
 
         // set the status message
@@ -704,10 +714,14 @@ inline fn isValidPathChar(c: u8) bool {
 }
 
 /// Table of valid header key characters.
+///
+/// NOTE: space (' ', 0x20) must be listed as invalid so the scalar fallback agrees with
+/// the SIMD path in `matchHeaderKey` (which stops at any byte <= space). Otherwise a key
+/// containing a space would be accepted or rejected depending on how many bytes remain.
 const key_map = createCharMap(.{
     // Invalid characters.
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,  16,
-    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, ':', 127,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, ' ', ':', 127,
 });
 
 /// Checks if a given character is a valid header key character.
@@ -1102,4 +1116,97 @@ test parseResponse {
     try testing.expectEqualStrings("localhost", headers[0].value);
     try testing.expectEqualStrings("Some-Number-Sequence", headers[1].key);
     try testing.expectEqualStrings("123291429", headers[1].value);
+}
+
+test "parseRequest: does not read past slice end (OOB regression)" {
+    // The backing array is one byte longer than the slice we hand to the parser, and that
+    // extra byte is `\n`. Before the end-of-buffer guards, `parseHeaders` would read this
+    // byte, treat it as end-of-headers, and report a completed parse that consumed *more*
+    // bytes than the slice it was given. It must return `error.Incomplete` instead.
+    var backing: [17]u8 = undefined;
+    const req = "GET / HTTP/1.1\r\n"; // 16 bytes: well-formed request line, header section truncated
+    @memcpy(backing[0..16], req);
+    backing[16] = '\n';
+    const slice: []const u8 = backing[0..16];
+
+    var method: Method = .unknown;
+    var path: ?[]const u8 = null;
+    var version: Version = .@"1.0";
+    var headers: [8]Header = undefined;
+    var header_count: usize = 0;
+
+    try testing.expectError(
+        error.Incomplete,
+        parseRequest(slice, &method, &path, &version, &headers, &header_count),
+    );
+}
+
+test "parseRequest: truncated inputs return Incomplete" {
+    // Each of these ends right where the parser would otherwise dereference one byte past
+    // the buffer (path, header key, header value, and between-headers). All must report
+    // `error.Incomplete` so the caller can read more and retry.
+    const truncations = [_][]const u8{
+        "GET / HTTP/1.1\r\n", // header section not started, ends on CRLF
+        "GET /aaaaaaaaaaaa", // path with no delimiter yet (>= min_request_len)
+        "GET / HTTP/1.1\r\nHost", // header key not terminated by ':'
+        "GET / HTTP/1.1\r\nHost: x", // header value not terminated by CRLF
+        "GET / HTTP/1.1\r\nHost: x\r\n", // one full header, missing final CRLF
+    };
+
+    for (truncations) |req| {
+        var method: Method = .unknown;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(
+            error.Incomplete,
+            parseRequest(req, &method, &path, &version, &headers, &header_count),
+        );
+    }
+}
+
+test "parseRequest: space in header key is rejected regardless of match path" {
+    // The same key "A B" must be rejected whether the SIMD matcher (>= 16 bytes remaining)
+    // or the scalar fallback (< 16 bytes) runs. Before `key_map` listed space as invalid,
+    // the scalar path accepted "A B" while the SIMD path rejected it.
+    const reqs = [_][]const u8{
+        "GET / HTTP/1.1\r\nA B: v\r\n\r\n", // short tail -> scalar matchHeaderKey
+        "GET / HTTP/1.1\r\nA B: valuevaluevaluevalue\r\n\r\n", // long tail -> SIMD matchHeaderKey
+    };
+
+    for (reqs) |req| {
+        var method: Method = .unknown;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(
+            error.Invalid,
+            parseRequest(req, &method, &path, &version, &headers, &header_count),
+        );
+    }
+}
+
+test "parseResponse: truncated status/headers return Incomplete" {
+    const truncations = [_][]const u8{
+        "HTTP/1.1 200\r\n", // status line only, missing final CRLF
+        "HTTP/1.1 200 OK", // status message not terminated
+        "HTTP/1.1 200 OK\r\nHost: x", // header value not terminated
+    };
+
+    for (truncations) |res| {
+        var version: Version = .@"1.0";
+        var status_code: u16 = 0;
+        var status_msg: ?[]const u8 = null;
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(
+            error.Incomplete,
+            parseResponse(res, &version, &status_code, &status_msg, &headers, &header_count),
+        );
+    }
 }
