@@ -43,6 +43,22 @@ For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https
 > [!IMPORTANT]
 > **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~11x slower. The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
 
+## Fuzzing
+
+The fuzzing harness in [`src/fuzz.zig`](src/fuzz.zig) uses Zig's native coverage-guided fuzzer:
+
+```sh
+zig build fuzz          # replay the seed corpus through the oracles (fast regression check)
+zig build fuzz --fuzz   # coverage-guided fuzzing with a live web UI
+```
+
+Plain bounds checking can't catch this parser's most likely bug class — it walks the buffer with `[*]` many-item pointers, so a 1-byte overread doesn't fault, it silently reads adjacent memory. The harness makes that class visible with two oracles:
+
+* **Guard pages** — every parse runs on a copy whose last byte abuts a `PROT_NONE` page, so any overread is an instant segfault.
+* **Prefix exactness** — a parse that consumed N bytes must reproduce byte-identical results from exactly those N bytes, and every strict prefix must return `error.Incomplete`. Since shorter tails select different matcher tiers (SIMD → SWAR → scalar), this also flags tier divergence whenever a scalar tier rejects bytes the vector tier accepted.
+
+`zig build test` also replays the fuzz corpus, so CI exercises the oracles on every run.
+
 ## Usage
 
 ```zig

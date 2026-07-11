@@ -101,4 +101,35 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
+
+    // Fuzzing harness (see src/fuzz.zig and issue #2).
+    // `zig build fuzz` replays the seed corpus through the oracles (regression mode);
+    // `zig build fuzz --fuzz` runs coverage-guided fuzzing.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hparse", .module = lib_mod },
+        },
+    });
+
+    const fuzz_tests = b.addTest(.{
+        .root_module = fuzz_mod,
+        // Patched copy of the default test runner; the stock one fails to compile in
+        // fuzz mode (`-ffuzz`) on Zig 0.16.0. See the doc comment in the file.
+        .test_runner = .{ .path = b.path("src/fuzz_test_runner.zig"), .mode = .server },
+        // The self-hosted x86_64 backend emits no fuzz coverage instrumentation (the
+        // build runner's coverage thread panics on an empty PC table). It also
+        // scalarizes @Vector code, and we want to fuzz the real SIMD paths.
+        .use_llvm = true,
+    });
+
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+
+    const fuzz_step = b.step("fuzz", "Run fuzz harness (pass --fuzz to actually fuzz)");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
+    // Regular test runs also replay the fuzz corpus as regression tests.
+    test_step.dependOn(&run_fuzz_tests.step);
 }
