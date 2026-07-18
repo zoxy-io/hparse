@@ -121,17 +121,22 @@ fn checkRequest(input: []const u8) !void {
     const g = primary.copy(input);
 
     var method: hparse.Method = .unknown;
+    var method_token: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var version: hparse.Version = .@"1.0";
     var headers: [max_headers]hparse.Header = undefined;
     var count: usize = 0;
 
     // Memory-safety oracle: any overread during this call faults on the guard page.
-    const n = hparse.parseRequest(g, &method, &path, &version, &headers, &count) catch return;
+    const n = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count) catch return;
 
     // Cheap invariants on every successful parse.
     try std.testing.expect(n <= g.len);
     try std.testing.expect(count <= max_headers);
+    try std.testing.expect(method != .unknown);
+    try std.testing.expect(method_token != null);
+    try std.testing.expect(method_token.?.len >= 1);
+    try expectWithin(g, method_token.?);
     try std.testing.expect(path != null);
     try expectWithin(g, path.?);
     for (headers[0..count]) |h| {
@@ -145,14 +150,16 @@ fn checkRequest(input: []const u8) !void {
     {
         const g2 = probe.copy(input[0..n]);
         var method2: hparse.Method = .unknown;
+        var method_token2: ?[]const u8 = null;
         var path2: ?[]const u8 = null;
         var version2: hparse.Version = .@"1.0";
         var headers2: [max_headers]hparse.Header = undefined;
         var count2: usize = 0;
 
-        const n2 = try hparse.parseRequest(g2, &method2, &path2, &version2, &headers2, &count2);
+        const n2 = try hparse.parseRequest(g2, &method2, &method_token2, &path2, &version2, &headers2, &count2);
         try std.testing.expectEqual(n, n2);
         try std.testing.expectEqual(method, method2);
+        try std.testing.expectEqualStrings(method_token.?, method_token2.?);
         try std.testing.expectEqual(version, version2);
         try std.testing.expect(path2 != null);
         try std.testing.expectEqualStrings(path.?, path2.?);
@@ -169,6 +176,7 @@ fn checkRequest(input: []const u8) !void {
     for (0..n) |k| {
         const gk = probe.copy(input[0..k]);
         var mk: hparse.Method = .unknown;
+        var mtk: ?[]const u8 = null;
         var pk: ?[]const u8 = null;
         var vk: hparse.Version = .@"1.0";
         var hk: [max_headers]hparse.Header = undefined;
@@ -176,7 +184,7 @@ fn checkRequest(input: []const u8) !void {
 
         try std.testing.expectError(
             error.Incomplete,
-            hparse.parseRequest(gk, &mk, &pk, &vk, &hk, &ck),
+            hparse.parseRequest(gk, &mk, &mtk, &pk, &vk, &hk, &ck),
         );
     }
 }
@@ -294,6 +302,9 @@ const request_corpus = [_][]const u8{
     seed("GET / HTTP/1.1\r\nHost"), // truncated header key
     seed("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), // truncated path
     seed("TRACE / HTTP/1.1\r\nA B: v\r\n\r\n"), // space in key (must reject)
+    seed("PROPFIND /dav HTTP/1.1\r\nDepth: 0\r\n\r\n"), // extension method
+    seed("M-SEARCH * HTTP/1.1\r\n\r\n"), // extension method with tchar '-'
+    seed("POSTER /x HTTP/1.1\r\n\r\n"), // registered-method prefix collision
 };
 
 const response_corpus = [_][]const u8{

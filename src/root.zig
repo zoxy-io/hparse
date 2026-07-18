@@ -38,10 +38,11 @@ const VectorInt = std.meta.Int(.unsigned, vec_size);
 
 /// HTTP methods.
 ///
-/// Only the nine standard methods below are recognized; extension methods
-/// (PROPFIND, MKCOL, ...) are intentionally rejected by `parseRequest` with
-/// `error.Invalid` — matching known methods as 4-byte magic integers is part
-/// of what makes the parser fast.
+/// The nine registered methods below are matched as 4-byte magic integers
+/// — the fast path that keeps this parser quick. Any other legal RFC 9110
+/// token (PROPFIND, MKCOL, ...) parses as `.extension`; the raw bytes of
+/// every method, registered or not, are returned through `parseRequest`'s
+/// `method_token`.
 pub const Method = enum(u8) {
     /// Never produced by the parser; use it as the caller-side initialization
     /// sentinel (a successful `parseRequest` always overwrites it).
@@ -55,6 +56,9 @@ pub const Method = enum(u8) {
     options,
     trace,
     patch,
+    /// A token that is none of the nine above; the bytes live in
+    /// `method_token`.
+    extension,
 };
 
 /// HTTP versions
@@ -184,27 +188,71 @@ const Cursor = struct {
         cursor.advance(1);
     }
 
-    /// Parses the method and the trailing space.
-    /// SAFETY: This function doesn't check if out of bounds reachable.
-    inline fn parseMethod(cursor: *Cursor, method: *Method) ParseRequestError!void {
+    /// Parses the method and the trailing space into `method` and
+    /// `method_token`. The nine registered methods match as 4-byte magic
+    /// integers (the fast path); any other RFC 9110 token (PROPFIND,
+    /// MKCOL, ...) takes the fallback scan and comes out as `.extension`.
+    /// `method_token` receives the raw token bytes on both paths.
+    inline fn parseMethod(
+        cursor: *Cursor,
+        method: *Method,
+        method_token: *?[]const u8,
+    ) ParseRequestError!void {
+        const token_start = cursor.current();
+        if (cursor.matchKnownMethod()) |known| {
+            // The cursor sits one past the trailing space; the token is
+            // everything before that space.
+            const consumed = cursor.current() - token_start;
+            assert(consumed >= 4);
+            method.* = known;
+            method_token.* = token_start[0 .. consumed - 1];
+            return;
+        }
+
+        // Extension method: scan the token (RFC 9110 §9.1: method = token)
+        // up to the delimiting space. Bounded by the buffer end.
+        while (cursor.end - cursor.idx > 0 and isValidMethodChar(cursor.char())) {
+            cursor.advance(1);
+        }
+        // Ran out of buffer before any delimiter: read more and retry.
+        if (cursor.current() == cursor.end) {
+            return error.Incomplete;
+        }
+        const token_end = cursor.current();
+        // An empty token, or a token stopped by anything but the single
+        // delimiting space, is malformed.
+        if (token_end == token_start) {
+            return error.Invalid;
+        }
+        if (cursor.char() != ' ') {
+            return error.Invalid;
+        }
+        cursor.advance(1);
+        method.* = .extension;
+        method_token.* = token_start[0 .. token_end - token_start];
+    }
+
+    /// Matches the nine registered methods, each with its trailing space,
+    /// as 4-byte magic integers. Advances past method and space only on a
+    /// match; rewinds to the token start otherwise.
+    /// SAFETY: requires 8 readable bytes (`min_request_len` covers it).
+    inline fn matchKnownMethod(cursor: *Cursor) ?Method {
+        assert(cursor.hasLength(8));
+        const token_start = cursor.current();
         // create an u32 out of received bytes to match the method
         const m_u32: u32 = cursor.asInteger(u32);
         // advance 4 since we just consumed 4
         cursor.advance(4);
 
-        // we consume the method + trailing space here
-        method.* = blk: switch (m_u32) {
-            GET_ => {
-                break :blk .get;
-            },
+        const known: ?Method = blk: switch (m_u32) {
+            GET_ => break :blk .get,
             POST => {
                 // expect space after this
                 if (cursor.peek(' ')) {
                     cursor.advance(1);
                     break :blk .post;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
             HEAD => {
                 // expect space after this
@@ -212,20 +260,16 @@ const Cursor = struct {
                     cursor.advance(1);
                     break :blk .head;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
-            PUT_ => {
-                break :blk .put;
-            },
+            PUT_ => break :blk .put,
             DELE => {
                 // expect `TE ` after this
                 if (cursor.peek3('T', 'E', ' ')) {
                     cursor.advance(3);
                     break :blk .delete;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
             CONN => {
                 // expect `ECT ` after this
@@ -233,8 +277,7 @@ const Cursor = struct {
                     cursor.advance(4);
                     break :blk .connect;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
             OPTI => {
                 // expect `ONS ` after this
@@ -242,8 +285,7 @@ const Cursor = struct {
                     cursor.advance(4);
                     break :blk .options;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
             TRAC => {
                 // expect `E ` after this
@@ -251,8 +293,7 @@ const Cursor = struct {
                     cursor.advance(2);
                     break :blk .trace;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
             PATC => {
                 // expect 'H ' after this
@@ -260,11 +301,16 @@ const Cursor = struct {
                     cursor.advance(2);
                     break :blk .patch;
                 }
-
-                return error.Invalid;
+                break :blk null;
             },
-            else => return error.Invalid,
-        }; // method + trailing space is consumed
+            else => break :blk null,
+        };
+        if (known == null) {
+            // Not a registered method: rewind so the extension-token scan
+            // starts from the first byte.
+            cursor.idx = token_start;
+        }
+        return known;
     }
 
     /// Validates path characters and advances the cursor as much as validated.
@@ -657,6 +703,22 @@ const Cursor = struct {
     }
 };
 
+/// Table of valid method characters — token (tchar) from RFC 9110 §5.6.2:
+/// letters, digits, and "!#$%&'*+-.^_`|~".
+const method_map: [256]u1 = blk: {
+    var map = [_]u1{0} ** 256;
+    for ("!#$%&'*+-.^_`|~") |c| map[c] = 1;
+    for ('0'..'9' + 1) |c| map[c] = 1;
+    for ('A'..'Z' + 1) |c| map[c] = 1;
+    for ('a'..'z' + 1) |c| map[c] = 1;
+    break :blk map;
+};
+
+/// Checks if a given character is a valid method (token) character.
+inline fn isValidMethodChar(c: u8) bool {
+    return method_map[c] != 0;
+}
+
 /// Table of valid path characters.
 const path_map = createCharMap(.{
     // Invalid characters.
@@ -747,15 +809,17 @@ inline fn createCharMap(comptime invalids: anytype) [256]u1 {
 
 /// Parses an HTTP request.
 /// * `error.Incomplete` indicates more data is needed to complete the request.
-/// * `error.Invalid` indicates request is invalid/malformed. Note this includes requests
-///   using extension methods (PROPFIND, MKCOL, ...); only the methods in `Method` are
-///   recognized.
+/// * `error.Invalid` indicates request is invalid/malformed.
 /// * `error.TooManyHeaders` indicates `headers` was too small; retry with a larger slice.
 pub fn parseRequest(
     // Slice we want to parse.
     slice: []const u8,
-    /// Parsed method will be stored here.
+    /// Parsed method will be stored here. Extension methods (PROPFIND,
+    /// MKCOL, ...) come out as `.extension`.
     method: *Method,
+    /// The method's raw token bytes ("GET", "PROPFIND", ...) will be
+    /// stored here for every successful parse.
+    method_token: *?[]const u8,
     /// Parsed path will be stored here.
     path: *?[]const u8,
     /// Parsed HTTP version will be stored here.
@@ -780,7 +844,7 @@ pub fn parseRequest(
     var cursor = Cursor{ .idx = slice_start, .end = slice_end, .start = slice_start };
 
     // parse the method
-    try cursor.parseMethod(method);
+    try cursor.parseMethod(method, method_token);
     // parse the path
     try cursor.parsePath(path);
     // parse the HTTP version
@@ -908,8 +972,10 @@ test "cursor: parse method/path/version" {
 
             // test method
             var method = Method.unknown;
-            try cursor.parseMethod(&method);
+            var method_token: ?[]const u8 = null;
+            try cursor.parseMethod(&method, &method_token);
             try testing.expectEqual(expected, method);
+            try testing.expect(method_token != null);
 
             // test path
             var path: ?[]const u8 = null;
@@ -934,6 +1000,114 @@ test "cursor: parse method/path/version" {
     try check("PATCH / HTTP/1.1\r\n\r\n", .patch);
 }
 
+test "parseRequest: extension methods parse as tokens" {
+    const Case = struct { req: []const u8, token: []const u8 };
+    const cases = [_]Case{
+        .{ .req = "PROPFIND /dav HTTP/1.1\r\nDepth: 1\r\n\r\n", .token = "PROPFIND" },
+        .{ .req = "MKCOL /new HTTP/1.1\r\n\r\n", .token = "MKCOL" },
+        .{ .req = "M-SEARCH * HTTP/1.1\r\n\r\n", .token = "M-SEARCH" },
+        .{ .req = "VERSION-CONTROL /r HTTP/1.1\r\n\r\n", .token = "VERSION-CONTROL" },
+        // Registered-method prefixes must fall back to the token scan,
+        // not get rejected by the failed magic match.
+        .{ .req = "POSTER /x HTTP/1.1\r\n\r\n", .token = "POSTER" },
+        .{ .req = "GETX /x HTTP/1.1\r\n\r\n", .token = "GETX" },
+        // Tokens are case-sensitive; lowercase is a different (legal) token.
+        .{ .req = "get /x HTTP/1.1\r\n\r\n", .token = "get" },
+    };
+
+    for (cases) |case| {
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        const len = try parseRequest(
+            case.req,
+            &method,
+            &method_token,
+            &path,
+            &version,
+            &headers,
+            &header_count,
+        );
+        try testing.expectEqual(case.req.len, len);
+        try testing.expectEqual(Method.extension, method);
+        try testing.expectEqualStrings(case.token, method_token.?);
+        try testing.expectEqual(.@"1.1", version);
+    }
+}
+
+test "parseRequest: known methods also expose their token" {
+    const Case = struct { req: []const u8, method: Method, token: []const u8 };
+    const cases = [_]Case{
+        .{ .req = "GET / HTTP/1.1\r\n\r\n", .method = .get, .token = "GET" },
+        .{ .req = "DELETE / HTTP/1.1\r\n\r\n", .method = .delete, .token = "DELETE" },
+        .{ .req = "CONNECT host:443 HTTP/1.1\r\n\r\n", .method = .connect, .token = "CONNECT" },
+    };
+
+    for (cases) |case| {
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        _ = try parseRequest(
+            case.req,
+            &method,
+            &method_token,
+            &path,
+            &version,
+            &headers,
+            &header_count,
+        );
+        try testing.expectEqual(case.method, method);
+        try testing.expectEqualStrings(case.token, method_token.?);
+    }
+}
+
+test "parseRequest: malformed method tokens are rejected" {
+    const requests = [_][]const u8{
+        "P@TCH / HTTP/1.1\r\n\r\n", // '@' is not a tchar
+        " GET / HTTP/1.1\r\n\r\n", // empty token (leading space)
+        "\x01GET / HTTP/1.1\r\n\r\n", // control byte before the token
+    };
+
+    for (requests) |req| {
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(
+            error.Invalid,
+            parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
+        );
+    }
+}
+
+test "parseRequest: method token without its delimiter stays incomplete" {
+    // Sixteen tchar bytes and no space yet: the method may continue in the
+    // next read, so the caller must be told to retry, not given Invalid.
+    const req = "PROPFINDPROPFIND";
+    var method: Method = .unknown;
+    var method_token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: Version = .@"1.0";
+    var headers: [8]Header = undefined;
+    var header_count: usize = 0;
+
+    try testing.expectError(
+        error.Incomplete,
+        parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
+    );
+}
+
 test "parseRequest: bare LF line terminators are rejected" {
     // One bare LF at every structural position. Accepting any of these is
     // a smuggling ingredient (see the module doc); all must be Invalid,
@@ -948,6 +1122,7 @@ test "parseRequest: bare LF line terminators are rejected" {
 
     for (requests) |req| {
         var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var version: Version = .@"1.0";
         var headers: [8]Header = undefined;
@@ -955,7 +1130,7 @@ test "parseRequest: bare LF line terminators are rejected" {
 
         try testing.expectError(
             error.Invalid,
-            parseRequest(req, &method, &path, &version, &headers, &header_count),
+            parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
         );
     }
 }
@@ -1044,15 +1219,17 @@ test parseRequest {
     const buffer: []const u8 = "OPTIONS /hey-this-is-kinda-long-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
     var method: Method = .unknown;
+    var method_token: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var http_version: Version = .@"1.0";
     var headers: [2]Header = undefined;
     var header_count: usize = 0;
 
-    const len = try parseRequest(buffer[0..], &method, &path, &http_version, &headers, &header_count);
+    const len = try parseRequest(buffer[0..], &method, &method_token, &path, &http_version, &headers, &header_count);
 
     try testing.expect(len == buffer.len);
     try testing.expect(method == .options);
+    try testing.expectEqualStrings("OPTIONS", method_token.?);
     try testing.expect(path != null);
     try testing.expectEqualStrings("/hey-this-is-kinda-long-path", path.?);
     try testing.expect(http_version == .@"1.1");
@@ -1098,6 +1275,7 @@ test "parseRequest: does not read past slice end (OOB regression)" {
     const slice: []const u8 = backing[0..16];
 
     var method: Method = .unknown;
+    var method_token: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var version: Version = .@"1.0";
     var headers: [8]Header = undefined;
@@ -1105,7 +1283,7 @@ test "parseRequest: does not read past slice end (OOB regression)" {
 
     try testing.expectError(
         error.Incomplete,
-        parseRequest(slice, &method, &path, &version, &headers, &header_count),
+        parseRequest(slice, &method, &method_token, &path, &version, &headers, &header_count),
     );
 }
 
@@ -1123,6 +1301,7 @@ test "parseRequest: truncated inputs return Incomplete" {
 
     for (truncations) |req| {
         var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var version: Version = .@"1.0";
         var headers: [8]Header = undefined;
@@ -1130,7 +1309,7 @@ test "parseRequest: truncated inputs return Incomplete" {
 
         try testing.expectError(
             error.Incomplete,
-            parseRequest(req, &method, &path, &version, &headers, &header_count),
+            parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
         );
     }
 }
@@ -1146,6 +1325,7 @@ test "parseRequest: space in header key is rejected regardless of match path" {
 
     for (reqs) |req| {
         var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var version: Version = .@"1.0";
         var headers: [8]Header = undefined;
@@ -1153,7 +1333,7 @@ test "parseRequest: space in header key is rejected regardless of match path" {
 
         try testing.expectError(
             error.Invalid,
-            parseRequest(req, &method, &path, &version, &headers, &header_count),
+            parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
         );
     }
 }
@@ -1194,12 +1374,13 @@ test "parseRequest: OWS/HTAB handling in header values (RFC 7230)" {
 
     for (cases) |c| {
         var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var version: Version = .@"1.0";
         var headers: [8]Header = undefined;
         var header_count: usize = 0;
 
-        _ = try parseRequest(c.req, &method, &path, &version, &headers, &header_count);
+        _ = try parseRequest(c.req, &method, &method_token, &path, &version, &headers, &header_count);
         try testing.expect(header_count == 1);
         try testing.expectEqualStrings(c.expected, headers[0].value);
     }
@@ -1211,6 +1392,7 @@ test "parseRequest: full headers slice with more headers returns TooManyHeaders"
     const req = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n";
 
     var method: Method = .unknown;
+    var method_token: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var version: Version = .@"1.0";
     var headers: [2]Header = undefined;
@@ -1218,12 +1400,12 @@ test "parseRequest: full headers slice with more headers returns TooManyHeaders"
 
     try testing.expectError(
         error.TooManyHeaders,
-        parseRequest(req, &method, &path, &version, &headers, &header_count),
+        parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
     );
 
     // With a large enough slice the same request parses cleanly.
     var big: [8]Header = undefined;
-    const len = try parseRequest(req, &method, &path, &version, &big, &header_count);
+    const len = try parseRequest(req, &method, &method_token, &path, &version, &big, &header_count);
     try testing.expect(len == req.len);
     try testing.expect(header_count == 3);
 }

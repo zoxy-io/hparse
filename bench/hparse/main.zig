@@ -8,6 +8,7 @@ pub fn main() !void {
     var i: usize = 0;
     while (i < iters) : (i += 1) {
         var method: hparse.Method = .unknown;
+        var method_token: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var http_version: hparse.Version = .@"1.0";
         var headers: [32]hparse.Header = undefined;
@@ -16,6 +17,7 @@ pub fn main() !void {
         const consumed = try hparse.parseRequest(
             buffer[0..],
             &method,
+            &method_token,
             &path,
             &http_version,
             &headers,
@@ -30,5 +32,6 @@ pub fn main() !void {
         std.mem.doNotOptimizeAway(header_count);
         std.mem.doNotOptimizeAway(&headers);
         std.mem.doNotOptimizeAway(path);
+        std.mem.doNotOptimizeAway(method_token);
     }
 }
