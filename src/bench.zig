@@ -11,6 +11,7 @@ pub fn main() !void {
         var i: usize = 0;
         while (i < 1_000_000_0) : (i += 1) {
             var method: Method = .unknown;
+            var method_token: ?[]const u8 = null;
             var path: ?[]const u8 = null;
             var http_version: Version = .@"1.0";
             var headers: [32]Header = undefined;
@@ -19,6 +20,7 @@ pub fn main() !void {
             _ = try hparse.parseRequest(
                 buffer[0..],
                 &method,
+                &method_token,
                 &path,
                 &http_version,
                 &headers,

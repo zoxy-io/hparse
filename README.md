@@ -66,14 +66,21 @@ const buffer: []const u8 = "GET /hello-world HTTP/1.1\r\nHost: localhost\r\nConn
 
 // initialize with default values
 var method: Method = .unknown;
+var method_token: ?[]const u8 = null;
 var path: ?[]const u8 = null;
 var http_version: Version = .@"1.0";
 var headers: [32]Header = undefined;
 var header_count: usize = 0;
 
 // parse the request
-_ = try hparse.parseRequest(buffer[0..], &method, &path, &http_version, &headers, &header_count);
+_ = try hparse.parseRequest(buffer[0..], &method, &method_token, &path, &http_version, &headers, &header_count);
 ```
+
+The nine registered methods come back as their enum tags; any other RFC 9110
+token (`PROPFIND`, `MKCOL`, ...) parses as `.extension`. `method_token` always
+carries the method's raw bytes. Line terminators are strictly CRLF — a bare LF
+is rejected as `error.Invalid` (accepting both is a request-smuggling
+ingredient).
 
 ## Installation
 
