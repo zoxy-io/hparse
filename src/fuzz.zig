@@ -283,7 +283,7 @@ fn seed(comptime s: []const u8) []const u8 {
 
 const request_corpus = [_][]const u8{
     seed("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
-    seed("GET / HTTP/1.1\n\n"),
+    seed("GET / HTTP/1.1\n\n"), // bare LF terminators (must reject)
     seed("OPTIONS /hey-this-is-kinda-long-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
     seed("POST /submit HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello"),
     seed("DELETE /a/b/c?q=1&r=2#frag HTTP/1.1\r\nAccept: */*\r\n\r\n"),
@@ -300,7 +300,7 @@ const response_corpus = [_][]const u8{
     seed("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
     seed("HTTP/1.1 418 I'm a teapot\r\nHost: localhost\r\nSome-Number-Sequence: 123291429\r\n\r\n"),
     seed("HTTP/1.0 204\r\n\r\n"), // no status message
-    seed("HTTP/1.1 301   Moved Permanently\n\n"), // multiple spaces, bare LF
+    seed("HTTP/1.1 301   Moved Permanently\n\n"), // multiple spaces + bare LF (must reject)
     seed("HTTP/1.1 200 OK\r\nHost: x"), // truncated header value
 };
 
