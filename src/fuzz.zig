@@ -21,12 +21,20 @@
 //!    off (`-Duse-vectors=false`) parses the same bytes, and must accept or refuse
 //!    identically — the tiers disagreeing is what oracle 2 can only catch when the
 //!    disagreement happens to fall across a truncation boundary.
+//! 4. Reference differential against picohttpparser: where BOTH parsers accept, the
+//!    fields must match. Only where both accept — the two disagree about what is
+//!    legal by design, and those disagreements are triage material, not failures.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const hparse = @import("hparse");
 /// The same parser built with the @Vector tier forced off; see `diffRequestTiers`.
 const scalar = @import("hparse_scalar");
+
+/// The reference parser; see `diffRequestAgainstReference`.
+const pico = @cImport({
+    @cInclude("picohttpparser.h");
+});
 
 /// Fuzz inputs are capped at one page so a copy always fits in front of the guard page.
 const max_input = 1024;
@@ -271,6 +279,143 @@ fn diffResponseTiers(
     }
 }
 
+/// Where picohttpparser and hparse BOTH accept, every field must agree.
+///
+/// Only where both accept. The two disagree about what is legal on purpose, and every
+/// such disagreement is expected rather than interesting: picohttpparser takes a bare
+/// LF as a line ending, an obs-fold continuation line, a leading empty line before the
+/// request, and any digit as the HTTP minor version, all of which hparse refuses. So a
+/// verdict mismatch is not a failure here and is not reported — what this oracle is
+/// for is the case where the two agree a message is well-formed and then disagree
+/// about what it SAYS, which no amount of self-consistency checking can catch.
+///
+/// Both parsers read the guarded copy. picohttpparser only ever loads 16-byte blocks
+/// that lie entirely within the buffer, so it is safe to point at the guard page; a
+/// fault inside its frames would be a finding about it, not about hparse.
+fn diffRequestAgainstReference(
+    g: []const u8,
+    hparse_result: hparse.ParseRequestError!usize,
+    hparse_method: ?[]const u8,
+    hparse_path: ?[]const u8,
+    hparse_version: hparse.Version,
+    hparse_headers: *const [max_headers]hparse.Header,
+    hparse_count: usize,
+) !void {
+    @disableInstrumentation();
+
+    var method: [*c]const u8 = null;
+    var method_len: usize = 0;
+    var path: [*c]const u8 = null;
+    var path_len: usize = 0;
+    var minor_version: c_int = -1;
+    var headers: [max_headers]pico.phr_header = undefined;
+    // In: the capacity. Out: the count.
+    var count: usize = max_headers;
+
+    const reference_result = pico.phr_parse_request(
+        @ptrCast(g.ptr),
+        g.len,
+        &method,
+        &method_len,
+        &path,
+        &path_len,
+        &minor_version,
+        &headers,
+        &count,
+        0,
+    );
+
+    // -1 refused, -2 partial. Either way there is nothing to compare.
+    const consumed = hparse_result catch return;
+    if (reference_result < 0) return;
+
+    try std.testing.expectEqual(consumed, @as(usize, @intCast(reference_result)));
+    // A successful parse always sets both, but this oracle runs before the
+    // invariant that says so — fail rather than panic if it ever does not.
+    try std.testing.expect(hparse_method != null);
+    try std.testing.expect(hparse_path != null);
+    try std.testing.expectEqualStrings(hparse_method.?, method[0..method_len]);
+    try std.testing.expectEqualStrings(hparse_path.?, path[0..path_len]);
+    try std.testing.expectEqualStrings(@tagName(hparse_version), try referenceVersion(minor_version));
+    try std.testing.expectEqual(hparse_count, count);
+    try expectHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
+}
+
+/// `diffRequestAgainstReference` for the response side.
+fn diffResponseAgainstReference(
+    g: []const u8,
+    hparse_result: hparse.ParseRequestError!usize,
+    hparse_version: hparse.Version,
+    hparse_status: u16,
+    hparse_msg: ?[]const u8,
+    hparse_headers: *const [max_headers]hparse.Header,
+    hparse_count: usize,
+) !void {
+    @disableInstrumentation();
+
+    var minor_version: c_int = -1;
+    var status: c_int = -1;
+    var msg: [*c]const u8 = null;
+    var msg_len: usize = 0;
+    var headers: [max_headers]pico.phr_header = undefined;
+    var count: usize = max_headers;
+
+    const reference_result = pico.phr_parse_response(
+        @ptrCast(g.ptr),
+        g.len,
+        &minor_version,
+        &status,
+        &msg,
+        &msg_len,
+        &headers,
+        &count,
+        0,
+    );
+
+    const consumed = hparse_result catch return;
+    if (reference_result < 0) return;
+
+    try std.testing.expectEqual(consumed, @as(usize, @intCast(reference_result)));
+    try std.testing.expectEqual(@as(c_int, hparse_status), status);
+    try std.testing.expectEqualStrings(@tagName(hparse_version), try referenceVersion(minor_version));
+    // An absent status message is `null` on one side and a zero length on the other;
+    // that is a representation choice, not a disagreement about the bytes.
+    try std.testing.expectEqualStrings(
+        hparse_msg orelse "",
+        if (msg_len == 0) "" else msg[0..msg_len],
+    );
+    try std.testing.expectEqual(hparse_count, count);
+    try expectHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
+}
+
+/// picohttpparser reports the minor version as a digit and takes any of them;
+/// `hparse.Version` has two values because it accepts only two. Reaching this with
+/// anything else means hparse accepted a version it has no representation for, so it
+/// is a finding rather than something to map onto the nearest tag.
+fn referenceVersion(minor_version: c_int) ![]const u8 {
+    @disableInstrumentation();
+    return switch (minor_version) {
+        0 => "1.0",
+        1 => "1.1",
+        else => error.ReferenceMinorVersionOutOfRange,
+    };
+}
+
+/// Both parsers strip OWS from each end of a value, so the slices are directly
+/// comparable — no normalization, which would be the place to accidentally define
+/// away a real difference.
+fn expectHeadersMatch(ours: []const hparse.Header, theirs: []const pico.phr_header) !void {
+    @disableInstrumentation();
+    for (ours, theirs) |a, b| {
+        // A null name is picohttpparser reporting an obs-fold continuation line, which
+        // hparse refuses outright — so reaching this on a mutual accept would mean
+        // hparse had accepted a folded header, and the slice below would fault.
+        if (b.name == null) return error.ReferenceFoldedHeaderOnMutualAccept;
+        try std.testing.expectEqualStrings(a.key, b.name[0..b.name_len]);
+        try std.testing.expectEqualStrings(a.value, if (b.value_len == 0) "" else b.value[0..b.value_len]);
+    }
+}
+
 fn checkRequest(input: []const u8) !void {
     @disableInstrumentation();
     const g = primary.copy(input);
@@ -286,6 +431,7 @@ fn checkRequest(input: []const u8) !void {
     const one_shot = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count);
 
     try diffRequestTiers(g, one_shot, method, method_token, path, version, &headers, count);
+    try diffRequestAgainstReference(g, one_shot, method_token, path, version, &headers, count);
 
     if (one_shot == error.Invalid or one_shot == error.TooManyHeaders) {
         // The direction that matters most for a proxy and was previously
@@ -443,6 +589,7 @@ fn checkResponse(input: []const u8) !void {
     // Memory-safety oracle: any overread during this call faults on the guard page.
     const one_shot = hparse.parseResponse(g, &version, &status_code, &status_msg, &headers, &count);
     try diffResponseTiers(g, one_shot, version, status_code, status_msg, &headers, count);
+    try diffResponseAgainstReference(g, one_shot, version, status_code, status_msg, &headers, count);
     const n = one_shot catch return;
 
     // Cheap invariants on every successful parse.
