@@ -116,6 +116,37 @@ fn expectWithin(outer: []const u8, inner: []const u8) !void {
     try std.testing.expect(i_start + inner.len <= o_start + outer.len);
 }
 
+/// Drives `parseRequestResume` to the full length and requires it does not
+/// accept. Used on inputs the one-shot parser refuses.
+fn expectResumeRejects(g: []const u8) !void {
+    @disableInstrumentation();
+    var state: hparse.Resume = .{};
+    var method: hparse.Method = .unknown;
+    var token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: hparse.Version = .@"1.0";
+    var headers: [max_headers]hparse.Header = undefined;
+    var count: usize = 0;
+
+    const step = @max(1, g.len / 16);
+    var have: usize = 0;
+    while (have < g.len) {
+        have = @min(have + step, g.len);
+        if (hparse.parseRequestResume(
+            g[0..have],
+            &state,
+            &method,
+            &token,
+            &path,
+            &version,
+            &headers,
+            &count,
+        )) |_| {
+            return error.ResumeAcceptedWhatOneShotRefused;
+        } else |_| continue;
+    }
+}
+
 fn checkRequest(input: []const u8) !void {
     @disableInstrumentation();
     const g = primary.copy(input);
@@ -128,7 +159,18 @@ fn checkRequest(input: []const u8) !void {
     var count: usize = 0;
 
     // Memory-safety oracle: any overread during this call faults on the guard page.
-    const n = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count) catch return;
+    const one_shot = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count);
+
+    if (one_shot == error.Invalid or one_shot == error.TooManyHeaders) {
+        // The direction that matters most for a proxy and was previously
+        // unchecked: the resumable path must never ACCEPT a message the
+        // one-shot path refuses. Incomplete is fine — it means "still waiting"
+        // — but a success here would be two parsers disagreeing about whether
+        // a request exists at all.
+        try expectResumeRejects(g);
+        return;
+    }
+    const n = one_shot catch return;
 
     // Cheap invariants on every successful parse.
     try std.testing.expect(n <= g.len);
@@ -190,6 +232,8 @@ fn checkRequest(input: []const u8) !void {
                 error.Incomplete => {
                     // The cursor must never rewind or run past what it was given.
                     try std.testing.expect(state.offset <= have);
+                    try std.testing.expect(state.scanned >= state.offset);
+                    try std.testing.expect(state.scanned <= have);
                     continue;
                 },
                 // A prefix may legitimately be rejected earlier than the whole,
@@ -281,6 +325,56 @@ fn checkResponse(input: []const u8) !void {
     for (headers[0..count]) |h| {
         try expectWithin(g, h.key);
         try expectWithin(g, h.value);
+    }
+
+    // Resume oracle, the response half. `parseResponseResume` shares
+    // `parseHeadersResume` with the request path, but nothing exercised it
+    // here at all — half of the new code was unfuzzed.
+    {
+        const step = @max(1, g.len / 16);
+        var state: hparse.Resume = .{};
+        var r_version: hparse.Version = .@"1.0";
+        var r_status: u16 = 0;
+        var r_msg: ?[]const u8 = null;
+        var r_headers: [max_headers]hparse.Header = undefined;
+        var r_count: usize = 0;
+        var have: usize = 0;
+        var resumed: ?usize = null;
+
+        while (have < g.len) {
+            have = @min(have + step, g.len);
+            if (hparse.parseResponseResume(
+                g[0..have],
+                &state,
+                &r_version,
+                &r_status,
+                &r_msg,
+                &r_headers,
+                &r_count,
+            )) |consumed| {
+                resumed = consumed;
+                break;
+            } else |err| switch (err) {
+                error.Incomplete => {
+                    try std.testing.expect(state.scanned >= state.offset);
+                    try std.testing.expect(state.scanned <= have);
+                    continue;
+                },
+                else => return error.ResumeDivergedOnError,
+            }
+        }
+
+        try std.testing.expect(resumed != null);
+        try std.testing.expectEqual(n, resumed.?);
+        try std.testing.expectEqual(version, r_version);
+        try std.testing.expectEqual(status_code, r_status);
+        try std.testing.expectEqual(count, r_count);
+        for (headers[0..count], r_headers[0..r_count]) |a, b| {
+            try std.testing.expectEqualStrings(a.key, b.key);
+            try std.testing.expectEqualStrings(a.value, b.value);
+            try expectWithin(g, b.key);
+            try expectWithin(g, b.value);
+        }
     }
 
     // Consumed-length round-trip (see checkRequest).
