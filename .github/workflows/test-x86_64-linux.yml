@@ -21,3 +21,10 @@ jobs:
 
       - name: Run Tests
         run: zig build test -Dtarget=${{ matrix.target }}
+
+      # The seed corpus through the fuzz oracles: deterministic, a couple of
+      # seconds, and the gate that was missing. The guard-page and consumed-
+      # length oracles found an accepted empty request-target that had been
+      # reachable the whole time — they were simply never run in CI.
+      - name: Fuzz corpus
+        run: zig build fuzz -Dtarget=${{ matrix.target }}
