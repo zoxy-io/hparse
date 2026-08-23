@@ -28,3 +28,9 @@ jobs:
       # reachable the whole time — they were simply never run in CI.
       - name: Fuzz corpus
         run: zig build fuzz -Dtarget=${{ matrix.target }}
+
+      # The SWAR/scalar tier. `suggestVectorLength` is non-null on every target
+      # here, so without forcing it off the scalar half of each
+      # `if (comptime use_vectors)` is never executed by any other job.
+      - name: Run tests (scalar tier)
+        run: zig build test -Dtarget=${{ matrix.target }} -Duse-vectors=false

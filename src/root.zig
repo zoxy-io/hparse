@@ -8,6 +8,7 @@
 //! leniency; a proxy-grade parser must not take it).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const comptimePrint = std.fmt.comptimePrint;
@@ -15,15 +16,26 @@ const comptimePrint = std.fmt.comptimePrint;
 /// Block size of the CPU.
 const block_size = @sizeOf(usize);
 
+// Both tier constants default to the target CPU's own answer; `build_options`
+// only overrides them when a build asks (`-Duse-vectors=false`, `-Dvec-size=16`).
+// Nothing outside a test should: the detection below is what makes this parser
+// fast on the machine it was built for. The overrides exist because
+// `std.simd.suggestVectorLength` is non-null on every target hparse builds for,
+// so the SWAR/scalar tier below each `use_vectors` branch is otherwise
+// unreachable — and the fuzz harness diffs a forced-scalar build against this
+// one to keep the tiers from disagreeing about the same bytes.
+
 // If suggested vector length is null, prefer not to use vectors!
-const use_vectors = blk: {
-    const recommended = std.simd.suggestVectorLength(u8);
-    break :blk if (recommended == null) false else true;
-};
+const use_vectors = build_options.use_vectors orelse (std.simd.suggestVectorLength(u8) != null);
 
 /// This is what we use for vector sizes in vectored operations.
 /// If `use_vectors` is false, this gives the default block size for the CPU.
-const vec_size = blk: {
+///
+/// A forced `-Dvec-size` is ignored when vectors are off, rather than recorded and
+/// unused: every reader of this sits inside `if (comptime use_vectors)`, so the build
+/// would run the SWAR loops at `block_size` while `vector_size` advertised the width
+/// of a tier it does not contain.
+const vec_size = if (!use_vectors) block_size else build_options.vec_size orelse blk: {
     if (std.simd.suggestVectorLength(u8)) |recommended| {
         // In the future, we can look for ways to utilize 512-bit (AVX-512) or even larger registers.
         break :blk if (recommended >= 64) 32 else recommended;
@@ -32,6 +44,20 @@ const vec_size = blk: {
         break :blk block_size;
     }
 };
+
+comptime {
+    // `VectorInt` is a bit per lane and `@ctz` reads it as the advance, so a width
+    // that is not a power of two would silently mis-index the buffer.
+    if (!std.math.isPowerOfTwo(vec_size)) @compileError("vec_size must be a power of two");
+}
+
+/// Which scan tier this build compiled. Exposed so the fuzz harness can prove the
+/// two builds it diffs really are different tiers, rather than quietly comparing a
+/// build against itself.
+pub const uses_vectors = use_vectors;
+
+/// Width in bytes of the scan tier this build compiled.
+pub const vector_size: usize = vec_size;
 
 /// `vec_size` as unsigned integer type.
 const VectorInt = std.meta.Int(.unsigned, vec_size);
