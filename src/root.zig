@@ -91,6 +91,9 @@ const HTTP_1_1: u64 = @bitCast([8]u8{ 'H', 'T', 'T', 'P', '/', '1', '.', '1' });
 const min_request_len = 0x10;
 
 /// * `error.Incomplete` — caller should read more bytes into the buffer and retry.
+///   `header_count` is left holding the headers parsed so far rather than being
+///   untouched; `parseRequestResume`/`parseResponseResume` turn that into a
+///   resume point instead of making the caller start over.
 /// * `error.Invalid` — the request/response is malformed.
 /// * `error.TooManyHeaders` — the provided `headers` slice was too small; caller can
 ///   retry with a larger slice.
@@ -108,6 +111,11 @@ const Cursor = struct {
     /// Returns the current position.
     inline fn current(cursor: *const Cursor) [*]const u8 {
         return cursor.idx;
+    }
+
+    /// How far into the buffer the cursor has reached.
+    inline fn offsetFromStart(cursor: *const Cursor) usize {
+        return @intFromPtr(cursor.idx) - @intFromPtr(cursor.start);
     }
 
     /// Returns the current character.
@@ -410,6 +418,23 @@ const Cursor = struct {
         if (cursor.char() == ' ') {
             @branchHint(.likely); // likely go down here
 
+            // An empty request-target is not a request-target (RFC 9112
+            // §3.1.1: origin-form is at minimum "/"). Rejecting it here is
+            // also what makes `min_request_len` sound: the shortest LEGAL
+            // request, "A / HTTP/1.1\r\n\r\n", is exactly 16 bytes, so the
+            // fast-path length check can never refuse a complete request.
+            //
+            // While an empty target was accepted, it could: `x  HTTP/1.1\r\n
+            // \r\n` is 15 bytes, so it parsed when a spare byte happened to
+            // follow it in the buffer and returned Incomplete when it did
+            // not — the same bytes meaning two different things depending on
+            // what came after. A caller that had exactly that request and
+            // nothing more would wait for bytes that were never coming.
+            if (path_end == path_start) {
+                @branchHint(.unlikely);
+                return error.Invalid;
+            }
+
             // set path
             path.* = path_start[0 .. path_end - path_start];
 
@@ -624,16 +649,115 @@ const Cursor = struct {
         };
     }
 
-    /// Parses HTTP request headers.
+    /// The response line: version, status code, optional status message,
+    /// through the CRLF. Extracted so `parseResponse` and
+    /// `parseResponseResume` cannot drift apart in what they accept.
+    inline fn parseResponseLine(
+        cursor: *Cursor,
+        version: *Version,
+        status_code: *u16,
+        status_msg: *?[]const u8,
+    ) ParseRequestError!void {
+        // The fixed-width reads below — the 8-byte version, the space at 8,
+        // the three status digits at 9..11, the byte at 12 — are unguarded, so
+        // the precondition travels with the function now that it no longer
+        // sits directly under its caller's `min_res_len` check.
+        assert(cursor.hasLength(13));
+
+        // Parse HTTP version.
+        // Request and response differ in this sense so we can't use `Cursor.parseVersion` here.
+        {
+            const chunk = cursor.asInteger(u64);
+            // advance as much as consumed
+            cursor.advance(8);
+
+            // Match the version with magic integers.
+            version.* = blk: switch (chunk) {
+                HTTP_1_0 => break :blk .@"1.0",
+                HTTP_1_1 => break :blk .@"1.1",
+                else => return error.Invalid, // Unknown/unsupported HTTP version.
+            };
+
+            // Parse the space afterwards.
+            if (cursor.char() != ' ') {
+                @branchHint(.unlikely);
+                return error.Invalid;
+            }
+
+            // Consume the space.
+            cursor.advance(1);
+        }
+
+        // Parse status code.
+        {
+            // Make sure next 3 bytes are numeric (0-9).
+            const all_digits = cursor.idx[0] > 47 and cursor.idx[0] < 58 and
+                cursor.idx[1] > 47 and cursor.idx[1] < 58 and
+                cursor.idx[2] > 47 and cursor.idx[2] < 58;
+
+            if (!all_digits) {
+                @branchHint(.unlikely);
+                return error.Invalid;
+            }
+
+            // Parse the status code.
+            const hundreds: u16 = @as(u16, @intCast(cursor.idx[0] - '0')) * 100;
+            const tens: u16 = @as(u16, @intCast(cursor.idx[1] - '0')) * 10;
+            const ones: u16 = @as(u16, @intCast(cursor.idx[2] - '0'));
+
+            // Set the status code.
+            status_code.* = hundreds + tens + ones;
+
+            // eat bytes
+            cursor.advance(3);
+        }
+
+        // Parse status message if exists, otherwise, parse CRLF and continue.
+        switch (cursor.char()) {
+            ' ' => {
+                // Skip spaces if there are more.
+                cursor.skipSpaces();
+                // Get status message after.
+                try cursor.parseStatusMessage(status_msg);
+            },
+            // No status message: the next bytes must be the strict CRLF
+            // (anything else, bare LF included, is invalid).
+            else => try cursor.parseCrlf(),
+        }
+    }
+
+    /// Parses HTTP headers into `headers`, beginning at index `start_index`.
+    ///
     /// If the `headers` slice fills up before the terminating CRLF and another header
     /// follows, returns `error.TooManyHeaders` so the caller can retry with a larger slice.
-    inline fn parseHeaders(cursor: *Cursor, headers: []Header, count: *usize) ParseRequestError!void {
-        var i: usize = 0;
+    ///
+    /// On `error.Incomplete`, `count` holds the headers completed so far and
+    /// `resume_at` the offset of the first byte of the line that did not
+    /// finish. That offset is always a clean line boundary, because every
+    /// incomplete exit below happens either before a line is started or while
+    /// the cursor still sits on its first byte — which is what makes resuming
+    /// safe, and what turns a caller's retry loop from quadratic into linear.
+    inline fn parseHeaders(
+        cursor: *Cursor,
+        headers: []Header,
+        count: *usize,
+        start_index: usize,
+        resume_at: *usize,
+    ) ParseRequestError!void {
+        assert(start_index <= headers.len);
+        assert(@intFromPtr(cursor.idx) >= @intFromPtr(cursor.start));
+        assert(@intFromPtr(cursor.idx) <= @intFromPtr(cursor.end));
+
+        var i: usize = start_index;
         while (i < headers.len) : (i += 1) {
+            const line_start = cursor.offsetFromStart();
+
             // We need at least one byte to tell whether the header section has ended or
             // another header follows. Guard before dereferencing so we never read past the
             // end on a truncated request.
             if (cursor.current() == cursor.end) {
+                count.* = i;
+                resume_at.* = line_start;
                 return error.Incomplete;
             }
 
@@ -641,27 +765,52 @@ const Cursor = struct {
             // empty line ends it. A bare LF here falls through into
             // `parseHeader`, which rejects it as an invalid key character.
             if (cursor.char() == '\r') {
-                try cursor.parseCrlf();
+                cursor.parseCrlf() catch |err| {
+                    if (err == error.Incomplete) {
+                        count.* = i;
+                        resume_at.* = line_start;
+                    }
+                    return err;
+                };
                 // end of headers
                 count.* = i;
                 return;
             }
 
-            try cursor.parseHeader(&headers[i]);
+            cursor.parseHeader(&headers[i]) catch |err| {
+                if (err == error.Incomplete) {
+                    count.* = i;
+                    resume_at.* = line_start;
+                }
+                return err;
+            };
         }
 
         // Set count to highest.
         count.* = i;
 
+        // Captured once for both exits below. `parseCrlf` can stop between the
+        // CR and the LF, and an exit that does not report where it stopped
+        // leaves the caller's cursor on the PREVIOUS line — which then reads
+        // as "the header array is full again" and returns TooManyHeaders for a
+        // message that parses fine in one shot. A caller obeying the
+        // TooManyHeaders contract would retry with a bigger array, resume at
+        // the wrong index, and hand back a header slot it never wrote.
+        const tail_start = cursor.offsetFromStart();
+
         // The `headers` slice is full; we still need the terminating CRLF. Guard before
         // dereferencing so we never read past the end.
         if (cursor.current() == cursor.end) {
+            resume_at.* = tail_start;
             return error.Incomplete;
         }
 
         // We have to check for the ending CRLF, same as what we're doing at top.
         if (cursor.char() == '\r') {
-            try cursor.parseCrlf();
+            cursor.parseCrlf() catch |err| {
+                if (err == error.Incomplete) resume_at.* = tail_start;
+                return err;
+            };
             return;
         }
         // The `headers` slice is full and the next byte isn't the terminating CRLF.
@@ -829,7 +978,10 @@ pub fn parseRequest(
     /// Count of parsed headers will be set here.
     header_count: *usize,
 ) ParseRequestError!usize {
-    // We expect at least 15 bytes to start processing.
+    // The shortest LEGAL request is exactly `min_request_len` bytes:
+    // "A / HTTP/1.1\r\n\r\n" is 1+1+1+1+8+2+2 = 16. That is what makes this
+    // fast path safe — no complete request can be refused by it — and it holds
+    // only because an empty request-target is refused in `parsePath`.
     if (slice.len < min_request_len) {
         return error.Incomplete;
     }
@@ -850,10 +1002,134 @@ pub fn parseRequest(
     // parse the HTTP version
     try cursor.parseVersion(version);
     // parse HTTP headers
-    try cursor.parseHeaders(headers, header_count);
+    var resume_at: usize = 0;
+    try cursor.parseHeaders(headers, header_count, 0, &resume_at);
 
     // Return the total consumed length to caller.
     return cursor.current() - cursor.start;
+}
+
+/// Where an incomplete parse stopped, so the next attempt continues instead of
+/// starting over.
+///
+/// Without this, a streaming caller has no choice but to re-parse the whole
+/// head every time more bytes arrive, which makes parsing a head O(N^2) in the
+/// number of segments it arrives in — and the segmentation is chosen by
+/// whoever is sending. Measured against an 8 KiB head arriving one byte at a
+/// time: 8,858 parses, 39 MB scanned, 8.4 ms of CPU for a single head. At
+/// 64 KiB it is 2.19 GB and 371 ms.
+///
+/// Zero-initialise for a new message, then pass the SAME value back alongside
+/// a slice that has only GROWN AT THE END. Bytes already consumed must not
+/// have moved or changed: the header slices already written point into them.
+/// A caller whose buffer can shift — a compaction, a rebase, a ring wrap —
+/// must reset this to `.{}` and re-parse from the beginning. An offset past
+/// the end is refused; a buffer compacted in place at the same address is not
+/// detectable here, and is the caller's to avoid.
+///
+/// The other out-parameters are equally caller-owned across calls:
+///
+/// * `headers` must be the SAME array, with `headers[0..header_count]` intact.
+///   Those slots are not rewritten.
+/// * `method`, `method_token`, `path` and `version` (or `version`,
+///   `status_code`, `status_msg`) are written ONCE, by whichever call finishes
+///   the request or status line — `line_done` is what records that. The final
+///   successful call does not write them again, so a caller that resets them
+///   between calls will see a success return alongside a stale or null value.
+/// * On `error.TooManyHeaders` the state still points into the message, so a
+///   retry with a bigger array must first copy `headers[0..header_count]` into
+///   it. Resetting to `.{}` and re-parsing is the simpler option and costs one
+///   pass over a head that was already going to be rejected or grown.
+pub const Resume = struct {
+    /// Bytes at the front of the slice already parsed.
+    offset: usize = 0,
+    /// Headers already written into the caller's array.
+    header_count: usize = 0,
+    /// The request or status line is parsed; only headers remain.
+    line_done: bool = false,
+};
+
+/// `parseRequest`, resumable. Identical results, linear total work.
+///
+/// The request line has no interior resume point, so it is re-parsed until it
+/// completes — bounded by the length of that one line, never by the head.
+pub fn parseRequestResume(
+    slice: []const u8,
+    state: *Resume,
+    method: *Method,
+    method_token: *?[]const u8,
+    path: *?[]const u8,
+    version: *Version,
+    headers: []Header,
+    header_count: *usize,
+) ParseRequestError!usize {
+    // `state` is caller-supplied, and `offset` is the one input to this parser
+    // that is not a byte in the slice. An out-of-range offset would put the
+    // cursor past `end`, and every scan loop here computes `end - idx` as an
+    // unsigned pointer difference — which underflows to a huge length and runs
+    // off the buffer. So it is an error, not an assertion: assertions are gone
+    // in the ReleaseFast build a consumer is free to choose.
+    if (state.offset > slice.len) return error.Invalid;
+    assert(state.header_count <= headers.len);
+    if (!state.line_done) assert(state.header_count == 0);
+
+    const slice_start = slice.ptr;
+    var cursor = Cursor{
+        .idx = slice_start + state.offset,
+        .start = slice_start,
+        .end = slice_start + slice.len,
+    };
+
+    if (!state.line_done) {
+        if (slice.len < min_request_len) return error.Incomplete;
+        cursor.idx = slice_start;
+        try cursor.parseMethod(method, method_token);
+        try cursor.parsePath(path);
+        try cursor.parseVersion(version);
+        state.line_done = true;
+        state.offset = cursor.offsetFromStart();
+    }
+
+    return resumeHeaders(&cursor, state, slice.len, headers, header_count);
+}
+
+/// Never a valid resume point, so "parseHeaders did not report one" is
+/// distinguishable from "it reported the value we happened to seed".
+const resume_unset = std.math.maxInt(usize);
+
+/// The header phase of a resumable parse.
+///
+/// Shared by the request and response entry points on purpose: they differ
+/// only in their minimum length and their line parser, and a correctness fix
+/// applied to one and missed in the other is exactly the drift that extracting
+/// `parseResponseLine` was meant to prevent.
+fn resumeHeaders(
+    cursor: *Cursor,
+    state: *Resume,
+    slice_len: usize,
+    headers: []Header,
+    header_count: *usize,
+) ParseRequestError!usize {
+    assert(state.line_done);
+
+    var resume_at: usize = resume_unset;
+    cursor.parseHeaders(headers, header_count, state.header_count, &resume_at) catch |err| {
+        if (err == error.Incomplete) {
+            // Every incomplete exit reports where it stopped. Seeding with a
+            // sentinel rather than `state.offset` is what makes a missed
+            // report an assertion failure instead of a silent rewind to the
+            // previous line — which is how the tail-block exit hid.
+            assert(resume_at != resume_unset);
+            assert(resume_at >= state.offset); // never rewinds
+            assert(resume_at <= slice_len);
+
+            state.offset = resume_at;
+            state.header_count = header_count.*;
+        }
+        return err;
+    };
+
+    return cursor.offsetFromStart();
 }
 
 /// Minimum response len.
@@ -890,72 +1166,52 @@ pub fn parseResponse(
 
     var cursor = Cursor{ .idx = slice_start, .start = slice_start, .end = slice_end };
 
-    // Parse HTTP version.
-    // Request and response differ in this sense so we can't use `Cursor.parseVersion` here.
-    {
-        const chunk = cursor.asInteger(u64);
-        // advance as much as consumed
-        cursor.advance(8);
-
-        // Match the version with magic integers.
-        version.* = blk: switch (chunk) {
-            HTTP_1_0 => break :blk .@"1.0",
-            HTTP_1_1 => break :blk .@"1.1",
-            else => return error.Invalid, // Unknown/unsupported HTTP version.
-        };
-
-        // Parse the space afterwards.
-        if (cursor.char() != ' ') {
-            @branchHint(.unlikely);
-            return error.Invalid;
-        }
-
-        // Consume the space.
-        cursor.advance(1);
-    }
-
-    // Parse status code.
-    {
-        // Make sure next 3 bytes are numeric (0-9).
-        const all_digits = cursor.idx[0] > 47 and cursor.idx[0] < 58 and
-            cursor.idx[1] > 47 and cursor.idx[1] < 58 and
-            cursor.idx[2] > 47 and cursor.idx[2] < 58;
-
-        if (!all_digits) {
-            @branchHint(.unlikely);
-            return error.Invalid;
-        }
-
-        // Parse the status code.
-        const hundreds: u16 = @as(u16, @intCast(cursor.idx[0] - '0')) * 100;
-        const tens: u16 = @as(u16, @intCast(cursor.idx[1] - '0')) * 10;
-        const ones: u16 = @as(u16, @intCast(cursor.idx[2] - '0'));
-
-        // Set the status code.
-        status_code.* = hundreds + tens + ones;
-
-        // eat bytes
-        cursor.advance(3);
-    }
-
-    // Parse status message if exists, otherwise, parse CRLF and continue.
-    switch (cursor.char()) {
-        ' ' => {
-            // Skip spaces if there are more.
-            cursor.skipSpaces();
-            // Get status message after.
-            try cursor.parseStatusMessage(status_msg);
-        },
-        // No status message: the next bytes must be the strict CRLF
-        // (anything else, bare LF included, is invalid).
-        else => try cursor.parseCrlf(),
-    }
+    try cursor.parseResponseLine(version, status_code, status_msg);
 
     // Parse headers.
-    try cursor.parseHeaders(headers, header_count);
+    var resume_at: usize = 0;
+    try cursor.parseHeaders(headers, header_count, 0, &resume_at);
 
     // Return the total consumed length to caller.
     return cursor.current() - cursor.start;
+}
+
+/// `parseResponse`, resumable. See `Resume` for the contract.
+pub fn parseResponseResume(
+    slice: []const u8,
+    state: *Resume,
+    version: *Version,
+    status_code: *u16,
+    status_msg: *?[]const u8,
+    headers: []Header,
+    header_count: *usize,
+) ParseRequestError!usize {
+    // `state` is caller-supplied, and `offset` is the one input to this parser
+    // that is not a byte in the slice. An out-of-range offset would put the
+    // cursor past `end`, and every scan loop here computes `end - idx` as an
+    // unsigned pointer difference — which underflows to a huge length and runs
+    // off the buffer. So it is an error, not an assertion: assertions are gone
+    // in the ReleaseFast build a consumer is free to choose.
+    if (state.offset > slice.len) return error.Invalid;
+    assert(state.header_count <= headers.len);
+    if (!state.line_done) assert(state.header_count == 0);
+
+    const slice_start = slice.ptr;
+    var cursor = Cursor{
+        .idx = slice_start + state.offset,
+        .start = slice_start,
+        .end = slice_start + slice.len,
+    };
+
+    if (!state.line_done) {
+        if (slice.len < min_res_len) return error.Incomplete;
+        cursor.idx = slice_start;
+        try cursor.parseResponseLine(version, status_code, status_msg);
+        state.line_done = true;
+        state.offset = cursor.offsetFromStart();
+    }
+
+    return resumeHeaders(&cursor, state, slice.len, headers, header_count);
 }
 
 const testing = std.testing;
@@ -1408,4 +1664,497 @@ test "parseRequest: full headers slice with more headers returns TooManyHeaders"
     const len = try parseRequest(req, &method, &method_token, &path, &version, &big, &header_count);
     try testing.expect(len == req.len);
     try testing.expect(header_count == 3);
+}
+
+// ---------------------------------------------------------------------------
+// resume
+
+/// The longest CRLF-terminated line in `wire`, which is what bounds the
+/// re-scanning a line-level resume cursor still does.
+fn longestLine(wire: []const u8) usize {
+    var longest: usize = 1;
+    var start: usize = 0;
+    for (wire, 0..) |byte, i| {
+        if (byte != '\n') continue;
+        longest = @max(longest, i + 1 - start);
+        start = i + 1;
+    }
+    return longest;
+}
+
+/// Feeds `wire` one byte at a time through `parseRequestResume`, and returns
+/// the total number of bytes the parser was asked to look at.
+///
+/// That total is the whole point: without a resume cursor a caller must hand
+/// the parser everything it has on every attempt, so the total is quadratic in
+/// the head length. With one it is linear, and this counts it so the property
+/// is a gate rather than a claim.
+fn driveRequestByteAtATime(
+    wire: []const u8,
+    headers: []Header,
+    method: *Method,
+    method_token: *?[]const u8,
+    path: *?[]const u8,
+    version: *Version,
+    header_count: *usize,
+    consumed: *usize,
+) !usize {
+    var state: Resume = .{};
+    var examined: usize = 0;
+    var have: usize = 0;
+    while (have < wire.len) {
+        have += 1;
+        // Bytes this call can possibly look at: everything past the resume
+        // point. With no resume cursor this would be `have` every time.
+        examined += have - state.offset;
+        if (parseRequestResume(
+            wire[0..have],
+            &state,
+            method,
+            method_token,
+            path,
+            version,
+            headers,
+            header_count,
+        )) |n| {
+            consumed.* = n;
+            return examined;
+        } else |err| switch (err) {
+            error.Incomplete => continue,
+            else => return err,
+        }
+    }
+    return error.Incomplete;
+}
+
+test "resume: byte-at-a-time equals one-shot, for requests" {
+    const wire = "GET /some/path?q=1 HTTP/1.1\r\n" ++
+        "host: example.com\r\nuser-agent: probe/1.0\r\nx-a: 1\r\naccept: */*\r\n\r\n";
+
+    var one_headers: [16]Header = undefined;
+    var one_method: Method = .unknown;
+    var one_token: ?[]const u8 = null;
+    var one_path: ?[]const u8 = null;
+    var one_version: Version = .@"1.0";
+    var one_count: usize = 0;
+    const one_consumed = try parseRequest(
+        wire,
+        &one_method,
+        &one_token,
+        &one_path,
+        &one_version,
+        &one_headers,
+        &one_count,
+    );
+
+    var inc_headers: [16]Header = undefined;
+    var inc_method: Method = .unknown;
+    var inc_token: ?[]const u8 = null;
+    var inc_path: ?[]const u8 = null;
+    var inc_version: Version = .@"1.0";
+    var inc_count: usize = 0;
+    var inc_consumed: usize = 0;
+    const examined = try driveRequestByteAtATime(
+        wire,
+        &inc_headers,
+        &inc_method,
+        &inc_token,
+        &inc_path,
+        &inc_version,
+        &inc_count,
+        &inc_consumed,
+    );
+
+    try testing.expectEqual(one_consumed, inc_consumed);
+    try testing.expectEqual(one_method, inc_method);
+    try testing.expectEqualStrings(one_token.?, inc_token.?);
+    try testing.expectEqualStrings(one_path.?, inc_path.?);
+    try testing.expectEqual(one_version, inc_version);
+    try testing.expectEqual(one_count, inc_count);
+    for (one_headers[0..one_count], inc_headers[0..inc_count]) |a, b| {
+        try testing.expectEqualStrings(a.key, b.key);
+        try testing.expectEqualStrings(a.value, b.value);
+    }
+
+    // The property this API exists for, stated exactly.
+    //
+    // Re-parsing from byte zero costs n*(n+1)/2. A LINE-level resume cursor
+    // costs, for each byte, the distance back to the start of the line it is
+    // in — so the bound is `n * longest_line`, not `n * n`. That is the real
+    // complexity and it is what gets asserted; claiming plain linearity here
+    // would be claiming intra-line resume, which this does not do.
+    const quadratic = wire.len * (wire.len + 1) / 2;
+    try testing.expect(examined <= wire.len * longestLine(wire));
+    try testing.expect(examined < quadratic / 2);
+}
+
+test "resume: byte-at-a-time equals one-shot, for responses" {
+    const wire = "HTTP/1.1 404 Not Found\r\n" ++
+        "server: nginx\r\ncontent-length: 153\r\nconnection: close\r\n\r\n";
+
+    var one_headers: [16]Header = undefined;
+    var one_version: Version = .@"1.0";
+    var one_status: u16 = 0;
+    var one_msg: ?[]const u8 = null;
+    var one_count: usize = 0;
+    const one_consumed = try parseResponse(
+        wire,
+        &one_version,
+        &one_status,
+        &one_msg,
+        &one_headers,
+        &one_count,
+    );
+
+    var inc_headers: [16]Header = undefined;
+    var inc_version: Version = .@"1.0";
+    var inc_status: u16 = 0;
+    var inc_msg: ?[]const u8 = null;
+    var inc_count: usize = 0;
+    var state: Resume = .{};
+    var examined: usize = 0;
+    var inc_consumed: usize = 0;
+    var have: usize = 0;
+    while (have < wire.len) {
+        have += 1;
+        examined += have - state.offset;
+        if (parseResponseResume(
+            wire[0..have],
+            &state,
+            &inc_version,
+            &inc_status,
+            &inc_msg,
+            &inc_headers,
+            &inc_count,
+        )) |n| {
+            inc_consumed = n;
+            break;
+        } else |err| switch (err) {
+            error.Incomplete => continue,
+            else => return err,
+        }
+    }
+
+    try testing.expectEqual(one_consumed, inc_consumed);
+    try testing.expectEqual(one_version, inc_version);
+    try testing.expectEqual(one_status, inc_status);
+    try testing.expectEqualStrings(one_msg.?, inc_msg.?);
+    try testing.expectEqual(one_count, inc_count);
+    for (one_headers[0..one_count], inc_headers[0..inc_count]) |a, b| {
+        try testing.expectEqualStrings(a.key, b.key);
+        try testing.expectEqualStrings(a.value, b.value);
+    }
+    try testing.expect(examined <= wire.len * longestLine(wire));
+}
+
+test "resume: every segmentation reaches the same answer" {
+    // Not just byte-at-a-time: the resume point must be right for any split,
+    // including ones that land inside a header name, inside a value, and
+    // between the CR and the LF of a line terminator.
+    const wire = "POST /submit HTTP/1.1\r\nhost: h\r\ncontent-length: 4\r\nx-b: vv\r\n\r\n";
+
+    var expected_headers: [8]Header = undefined;
+    var expected_method: Method = .unknown;
+    var expected_token: ?[]const u8 = null;
+    var expected_path: ?[]const u8 = null;
+    var expected_version: Version = .@"1.0";
+    var expected_count: usize = 0;
+    const expected_consumed = try parseRequest(
+        wire,
+        &expected_method,
+        &expected_token,
+        &expected_path,
+        &expected_version,
+        &expected_headers,
+        &expected_count,
+    );
+
+    for (1..wire.len) |step| {
+        var headers: [8]Header = undefined;
+        var method: Method = .unknown;
+        var token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var count: usize = 0;
+        var state: Resume = .{};
+        var have: usize = 0;
+        var consumed: usize = 0;
+
+        while (have < wire.len) {
+            have = @min(have + step, wire.len);
+            if (parseRequestResume(
+                wire[0..have],
+                &state,
+                &method,
+                &token,
+                &path,
+                &version,
+                &headers,
+                &count,
+            )) |n| {
+                consumed = n;
+                break;
+            } else |err| switch (err) {
+                error.Incomplete => continue,
+                else => return err,
+            }
+        }
+
+        try testing.expectEqual(expected_consumed, consumed);
+        try testing.expectEqual(expected_count, count);
+        try testing.expectEqualStrings(expected_path.?, path.?);
+        for (expected_headers[0..expected_count], headers[0..count]) |a, b| {
+            try testing.expectEqualStrings(a.key, b.key);
+            try testing.expectEqualStrings(a.value, b.value);
+        }
+    }
+}
+
+test "parseRequest: an empty request-target is refused" {
+    // RFC 9112 §3.1.1 — origin-form is at minimum "/". Found by the fuzzer's
+    // consumed-length round-trip oracle, which failed because accepting an
+    // empty target let a 15-byte "request" exist at all.
+    // At or above `min_request_len` the parser has enough bytes to decide, and
+    // the decision is Invalid.
+    const cases = [_][]const u8{
+        "GET  HTTP/1.1\r\n\r\n",
+        "x  HTTP/1.1\r\n\r\n ", // 16 bytes: one past the threshold
+        "POST  HTTP/1.1\r\nhost: h\r\n\r\n",
+    };
+    for (cases) |wire| {
+        try testing.expect(wire.len >= min_request_len);
+        var method: Method = .unknown;
+        var token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var count: usize = 0;
+        try testing.expectError(error.Invalid, parseRequest(
+            wire,
+            &method,
+            &token,
+            &path,
+            &version,
+            &headers,
+            &count,
+        ));
+    }
+
+    // Below the threshold the honest answer is "not yet" — the parser cannot
+    // see enough to judge, and no COMPLETE legal request is this short, so
+    // nothing valid is being deferred.
+    {
+        const short = "x  HTTP/1.1\r\n\r\n";
+        try testing.expect(short.len < min_request_len);
+        var method: Method = .unknown;
+        var token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var count: usize = 0;
+        try testing.expectError(error.Incomplete, parseRequest(
+            short,
+            &method,
+            &token,
+            &path,
+            &version,
+            &headers,
+            &count,
+        ));
+    }
+}
+
+test "parseRequest: the shortest legal request parses at exactly its own length" {
+    // The property the `min_request_len` fast path silently depended on: no
+    // COMPLETE request is shorter than the threshold, so handing the parser
+    // exactly one request can never look like "not enough bytes yet".
+    //
+    // Before empty targets were refused this was false, and the verdict on a
+    // complete request depended on how many unrelated bytes followed it.
+    const shortest = "A / HTTP/1.1\r\n\r\n";
+    try testing.expectEqual(@as(usize, 16), shortest.len);
+    try testing.expectEqual(@as(usize, 0x10), min_request_len);
+
+    var method: Method = .unknown;
+    var token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: Version = .@"1.0";
+    var headers: [8]Header = undefined;
+    var count: usize = 0;
+    const n = try parseRequest(
+        shortest,
+        &method,
+        &token,
+        &path,
+        &version,
+        &headers,
+        &count,
+    );
+    try testing.expectEqual(shortest.len, n);
+    try testing.expectEqualStrings("/", path.?);
+    try testing.expectEqual(@as(usize, 0), count);
+
+    // And the round trip the fuzzer checks: re-parsing exactly what was
+    // consumed gives the same answer rather than error.Incomplete.
+    var method2: Method = .unknown;
+    var token2: ?[]const u8 = null;
+    var path2: ?[]const u8 = null;
+    var version2: Version = .@"1.0";
+    var headers2: [8]Header = undefined;
+    var count2: usize = 0;
+    const n2 = try parseRequest(
+        shortest[0..n],
+        &method2,
+        &token2,
+        &path2,
+        &version2,
+        &headers2,
+        &count2,
+    );
+    try testing.expectEqual(n, n2);
+}
+
+test "parseRequest: every RFC 9112 request-target form is accepted" {
+    // Refusing an EMPTY target must not refuse any target that is merely
+    // unusual. hparse is used by a proxy, so absolute-form, authority-form
+    // (CONNECT) and asterisk-form (OPTIONS) all have to survive.
+    const cases = [_]struct { wire: []const u8, target: []const u8 }{
+        .{ .wire = "GET /p?q=1 HTTP/1.1\r\nhost: h\r\n\r\n", .target = "/p?q=1" },
+        .{ .wire = "GET http://h.example/p HTTP/1.1\r\nhost: h\r\n\r\n", .target = "http://h.example/p" },
+        .{ .wire = "CONNECT h.example:443 HTTP/1.1\r\nhost: h\r\n\r\n", .target = "h.example:443" },
+        .{ .wire = "OPTIONS * HTTP/1.1\r\nhost: h\r\n\r\n", .target = "*" },
+    };
+    for (cases) |c| {
+        var method: Method = .unknown;
+        var token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var count: usize = 0;
+        _ = try parseRequest(c.wire, &method, &token, &path, &version, &headers, &count);
+        try testing.expectEqualStrings(c.target, path.?);
+    }
+}
+
+test "resume: an exactly-full header array agrees with one-shot at every split" {
+    // The bug this pins: `parseHeaders`' tail block — reached only when the
+    // caller's array is exactly full — had an `Incomplete` exit that never
+    // reported where it stopped. The resume cursor then pointed at the
+    // PREVIOUS line, which read as "the array is full again" and returned
+    // TooManyHeaders for a message one-shot parsing accepts. A caller obeying
+    // the TooManyHeaders contract would retry with a larger array, resume at
+    // the wrong index, and hand back a header slot nothing had written.
+    //
+    // Every earlier resume test sized the array well above the header count,
+    // so none of them could reach that block.
+    const wire = "GET / HTTP/1.1\r\nA: b\r\n\r\n";
+    const exact = 1; // exactly as many headers as the message has
+
+    var expected_headers: [exact]Header = undefined;
+    var expected_method: Method = .unknown;
+    var expected_token: ?[]const u8 = null;
+    var expected_path: ?[]const u8 = null;
+    var expected_version: Version = .@"1.0";
+    var expected_count: usize = 0;
+    const expected_consumed = try parseRequest(
+        wire,
+        &expected_method,
+        &expected_token,
+        &expected_path,
+        &expected_version,
+        &expected_headers,
+        &expected_count,
+    );
+    try testing.expectEqual(@as(usize, exact), expected_count);
+
+    for (1..wire.len) |step| {
+        var headers: [exact]Header = undefined;
+        var method: Method = .unknown;
+        var token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var count: usize = 0;
+        var state: Resume = .{};
+        var have: usize = 0;
+        var consumed: usize = 0;
+
+        while (have < wire.len) {
+            have = @min(have + step, wire.len);
+            if (parseRequestResume(
+                wire[0..have],
+                &state,
+                &method,
+                &token,
+                &path,
+                &version,
+                &headers,
+                &count,
+            )) |n| {
+                consumed = n;
+                break;
+            } else |err| switch (err) {
+                error.Incomplete => continue,
+                else => return err,
+            }
+        }
+
+        try testing.expectEqual(expected_consumed, consumed);
+        try testing.expectEqual(expected_count, count);
+        try testing.expectEqualStrings(expected_headers[0].key, headers[0].key);
+        try testing.expectEqualStrings(expected_headers[0].value, headers[0].value);
+    }
+}
+
+test "resume: an out-of-range offset is refused rather than trusted" {
+    // `state.offset` is the one input to this parser that is not a byte in the
+    // slice. Past the end it would put the cursor beyond `end`, and every scan
+    // loop computes `end - idx` as an unsigned pointer difference — which
+    // underflows and runs off the buffer. An assertion would not survive the
+    // ReleaseFast build a consumer may choose, so it is an error.
+    const wire = "GET / HTTP/1.1\r\n\r\n";
+    var headers: [4]Header = undefined;
+    var method: Method = .unknown;
+    var token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: Version = .@"1.0";
+    var count: usize = 0;
+    var state: Resume = .{ .offset = wire.len + 1, .line_done = true };
+    try testing.expectError(error.Invalid, parseRequestResume(
+        wire,
+        &state,
+        &method,
+        &token,
+        &path,
+        &version,
+        &headers,
+        &count,
+    ));
+
+    const response = "HTTP/1.1 200 OK\r\n\r\n";
+    var rstate: Resume = .{ .offset = response.len + 1, .line_done = true };
+    var rversion: Version = .@"1.0";
+    var status: u16 = 0;
+    var msg: ?[]const u8 = null;
+    try testing.expectError(error.Invalid, parseResponseResume(
+        response,
+        &rstate,
+        &rversion,
+        &status,
+        &msg,
+        &headers,
+        &count,
+    ));
+
+    // And the boundary is inclusive: an offset EQUAL to the length is a
+    // legitimate "everything so far is consumed, waiting for more".
+    var edge: Resume = .{ .offset = response.len, .line_done = true };
+    try testing.expectError(error.Incomplete, parseResponseResume(
+        response,
+        &edge,
+        &rversion,
+        &status,
+        &msg,
+        &headers,
+        &count,
+    ));
 }

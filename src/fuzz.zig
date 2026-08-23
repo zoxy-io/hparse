@@ -144,6 +144,77 @@ fn checkRequest(input: []const u8) !void {
         try expectWithin(g, h.value);
     }
 
+    // Resume oracle: feeding the SAME bytes in growing prefixes through
+    // `parseRequestResume` must reach the identical answer. The resume cursor
+    // carries parser state across calls, so it is the one part of this parser
+    // whose correctness depends on history rather than on the current slice —
+    // exactly the shape a one-shot fuzz oracle cannot reach.
+    //
+    // Stepped rather than byte-at-a-time so long inputs stay affordable; the
+    // unit tests in root.zig cover every step size on fixed shapes.
+    //
+    // KNOWN GAP: these calls take sub-slices of the guarded region, so only
+    // the final full-length one abuts the PROT_NONE page — an overread by an
+    // intermediate call lands on the rest of the real input and goes unseen.
+    // The truncation oracle below re-copies each prefix for exactly that
+    // reason, which this cannot do: `copy` places bytes at the page's tail, so
+    // re-copying a prefix would move the bytes already parsed and break the
+    // `Resume` contract. Closing it needs a second, head-first region.
+    {
+        const step = @max(1, g.len / 16);
+        var state: hparse.Resume = .{};
+        var r_method: hparse.Method = .unknown;
+        var r_token: ?[]const u8 = null;
+        var r_path: ?[]const u8 = null;
+        var r_version: hparse.Version = .@"1.0";
+        var r_headers: [max_headers]hparse.Header = undefined;
+        var r_count: usize = 0;
+        var have: usize = 0;
+        var resumed: ?usize = null;
+
+        while (have < g.len) {
+            have = @min(have + step, g.len);
+            if (hparse.parseRequestResume(
+                g[0..have],
+                &state,
+                &r_method,
+                &r_token,
+                &r_path,
+                &r_version,
+                &r_headers,
+                &r_count,
+            )) |consumed| {
+                resumed = consumed;
+                break;
+            } else |err| switch (err) {
+                error.Incomplete => {
+                    // The cursor must never rewind or run past what it was given.
+                    try std.testing.expect(state.offset <= have);
+                    continue;
+                },
+                // A prefix may legitimately be rejected earlier than the whole,
+                // but the whole parsed, so a hard error here is a divergence.
+                else => return error.ResumeDivergedOnError,
+            }
+        }
+
+        try std.testing.expect(resumed != null);
+        try std.testing.expectEqual(n, resumed.?);
+        try std.testing.expectEqual(method, r_method);
+        try std.testing.expectEqual(version, r_version);
+        try std.testing.expectEqual(count, r_count);
+        try std.testing.expectEqualStrings(path.?, r_path.?);
+        try std.testing.expectEqualStrings(method_token.?, r_token.?);
+        // The resumed slices must point into the message too, not at whatever
+        // an earlier call happened to leave behind.
+        try expectWithin(g, r_path.?);
+        try expectWithin(g, r_token.?);
+        for (headers[0..count], r_headers[0..r_count]) |a, b| {
+            try std.testing.expectEqualStrings(a.key, b.key);
+            try std.testing.expectEqualStrings(a.value, b.value);
+        }
+    }
+
     // Consumed-length round-trip: re-parsing exactly the N consumed bytes must give a
     // byte-identical result — proves the parse never depended on bytes past what it
     // claims to consume.
