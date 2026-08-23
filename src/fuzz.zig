@@ -7,7 +7,8 @@
 //! The parser walks the buffer with `[*]const u8` many-item pointers, which Zig's bounds
 //! checking does not cover — a 1-byte overread past the slice does not crash and silently
 //! reads adjacent memory. A naive "call it and see if it faults" harness would never catch
-//! that class. Two oracles make it visible:
+//! that class. The first two oracles below make it visible; the third is about the
+//! tiers agreeing with each other rather than about memory:
 //!
 //! 1. Guard-page-backed input: every parse runs on a copy whose last byte abuts a
 //!    PROT_NONE page, so any read past the end is an immediate SIGSEGV.
@@ -16,10 +17,16 @@
 //!    strict prefix of them must return `error.Incomplete` — never a false accept, and
 //!    never `error.Invalid` (which would mean the SIMD/SWAR/scalar matcher tiers, selected
 //!    by remaining buffer length, disagree about the same bytes).
+//! 3. Path differential: a second build of the parser with the `@Vector` tier forced
+//!    off (`-Duse-vectors=false`) parses the same bytes, and must accept or refuse
+//!    identically — the tiers disagreeing is what oracle 2 can only catch when the
+//!    disagreement happens to fall across a truncation boundary.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const hparse = @import("hparse");
+/// The same parser built with the @Vector tier forced off; see `diffRequestTiers`.
+const scalar = @import("hparse_scalar");
 
 /// Fuzz inputs are capped at one page so a copy always fits in front of the guard page.
 const max_input = 1024;
@@ -147,6 +154,123 @@ fn expectResumeRejects(g: []const u8) !void {
     }
 }
 
+/// Path-differential oracle: the same bytes through a build of the parser with the
+/// `@Vector` tier forced off, compared against the tier this build ships.
+///
+/// Which tier runs is chosen by how many bytes remain, so the two builds see the
+/// same input through different code by construction — the shape of the
+/// SIMD-vs-scalar space-in-key divergence this parser has already had once.
+/// Accept/reject must match, and so must WHICH error: `Incomplete` from one tier
+/// and `Invalid` from the other is two parsers disagreeing about whether a message
+/// exists, which for a proxy is the whole bug class.
+///
+/// The scalar build parses the guarded copy too, so its SWAR loops and scalar tails
+/// get the memory-safety oracle rather than only the vector ones.
+///
+/// A build that itself forced vectors off makes this a self-comparison. That is the
+/// honest reading — the diff is against the tier being shipped — and a plain
+/// `zig build fuzz` is what exercises the real thing.
+///
+/// KNOWN GAP: only the one-shot entry points are diffed. `parseRequestResume` and
+/// `parseResponseResume` reach the same scans, but through their own phase
+/// bookkeeping, so a tier disagreement that only a resumed line can reach would
+/// not be seen here. Covering it means a second resume drive per input, which is
+/// the most expensive thing in this harness already.
+fn diffRequestTiers(
+    g: []const u8,
+    vector_result: hparse.ParseRequestError!usize,
+    vector_method: hparse.Method,
+    vector_token: ?[]const u8,
+    vector_path: ?[]const u8,
+    vector_version: hparse.Version,
+    vector_headers: *const [max_headers]hparse.Header,
+    vector_count: usize,
+) !void {
+    @disableInstrumentation();
+    // Were the build options ever to stop reaching the parser, this would compare a
+    // build against itself and the oracle would silently test nothing. Fail loudly,
+    // at compile time.
+    comptime std.debug.assert(!scalar.uses_vectors);
+
+    var method: scalar.Method = .unknown;
+    var token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: scalar.Version = .@"1.0";
+    var headers: [max_headers]scalar.Header = undefined;
+    var count: usize = 0;
+
+    const result = scalar.parseRequest(g, &method, &token, &path, &version, &headers, &count);
+
+    const vector_n = vector_result catch |vector_err| {
+        const err = if (result) |_| return error.TiersDisagreeOnAccept else |e| e;
+        if (err != vector_err) return error.TiersDisagreeOnError;
+        return;
+    };
+    const n = result catch return error.TiersDisagreeOnAccept;
+
+    try std.testing.expectEqual(vector_n, n);
+    try std.testing.expectEqual(vector_count, count);
+    try std.testing.expect(count <= max_headers);
+    // Separate module instances, so these are distinct types carrying the same tags.
+    try std.testing.expectEqualStrings(@tagName(vector_method), @tagName(method));
+    try std.testing.expectEqualStrings(@tagName(vector_version), @tagName(version));
+    try std.testing.expectEqual(vector_token == null, token == null);
+    if (vector_token) |vt| try std.testing.expectEqualStrings(vt, token.?);
+    try std.testing.expectEqual(vector_path == null, path == null);
+    if (vector_path) |vp| try std.testing.expectEqualStrings(vp, path.?);
+    for (vector_headers[0..vector_count], headers[0..count]) |a, b| {
+        try std.testing.expectEqualStrings(a.key, b.key);
+        try std.testing.expectEqualStrings(a.value, b.value);
+    }
+}
+
+/// `diffRequestTiers` for the response side.
+///
+/// Nothing in the status line is vectorized — `matchStatusMessage` is a byte-at-a-time
+/// loop, and the only `@Vector` scans in the parser are `matchPath`, `matchHeaderKey`
+/// and `matchHeaderValue`. What this diffs is therefore the two header scans reached
+/// through `parseResponse`, whose surrounding state differs from the request path's,
+/// plus the whole response line under both builds' guard-page copy.
+fn diffResponseTiers(
+    g: []const u8,
+    vector_result: hparse.ParseRequestError!usize,
+    vector_version: hparse.Version,
+    vector_status: u16,
+    vector_msg: ?[]const u8,
+    vector_headers: *const [max_headers]hparse.Header,
+    vector_count: usize,
+) !void {
+    @disableInstrumentation();
+    comptime std.debug.assert(!scalar.uses_vectors);
+
+    var version: scalar.Version = .@"1.0";
+    var status: u16 = 0;
+    var msg: ?[]const u8 = null;
+    var headers: [max_headers]scalar.Header = undefined;
+    var count: usize = 0;
+
+    const result = scalar.parseResponse(g, &version, &status, &msg, &headers, &count);
+
+    const vector_n = vector_result catch |vector_err| {
+        const err = if (result) |_| return error.TiersDisagreeOnAccept else |e| e;
+        if (err != vector_err) return error.TiersDisagreeOnError;
+        return;
+    };
+    const n = result catch return error.TiersDisagreeOnAccept;
+
+    try std.testing.expectEqual(vector_n, n);
+    try std.testing.expectEqual(vector_count, count);
+    try std.testing.expect(count <= max_headers);
+    try std.testing.expectEqualStrings(@tagName(vector_version), @tagName(version));
+    try std.testing.expectEqual(vector_status, status);
+    try std.testing.expectEqual(vector_msg == null, msg == null);
+    if (vector_msg) |vm| try std.testing.expectEqualStrings(vm, msg.?);
+    for (vector_headers[0..vector_count], headers[0..count]) |a, b| {
+        try std.testing.expectEqualStrings(a.key, b.key);
+        try std.testing.expectEqualStrings(a.value, b.value);
+    }
+}
+
 fn checkRequest(input: []const u8) !void {
     @disableInstrumentation();
     const g = primary.copy(input);
@@ -160,6 +284,8 @@ fn checkRequest(input: []const u8) !void {
 
     // Memory-safety oracle: any overread during this call faults on the guard page.
     const one_shot = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count);
+
+    try diffRequestTiers(g, one_shot, method, method_token, path, version, &headers, count);
 
     if (one_shot == error.Invalid or one_shot == error.TooManyHeaders) {
         // The direction that matters most for a proxy and was previously
@@ -315,7 +441,9 @@ fn checkResponse(input: []const u8) !void {
     var count: usize = 0;
 
     // Memory-safety oracle: any overread during this call faults on the guard page.
-    const n = hparse.parseResponse(g, &version, &status_code, &status_msg, &headers, &count) catch return;
+    const one_shot = hparse.parseResponse(g, &version, &status_code, &status_msg, &headers, &count);
+    try diffResponseTiers(g, one_shot, version, status_code, status_msg, &headers, count);
+    const n = one_shot catch return;
 
     // Cheap invariants on every successful parse.
     try std.testing.expect(n <= g.len);

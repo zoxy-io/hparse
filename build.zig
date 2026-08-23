@@ -15,6 +15,20 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // Which scan tier the parser compiles. Both default to null, meaning "detect
+    // from the target CPU" — what every ordinary build wants, and identical to the
+    // hardcoded detection these replace. Forcing them is for testing: on every
+    // target hparse builds for, `std.simd.suggestVectorLength` is non-null (SSE2 on
+    // baseline x86_64, NEON on aarch64), so the SWAR/scalar tier was unreachable and
+    // therefore untested. `-Duse-vectors=false` reaches it, and the fuzz harness
+    // diffs a build of each (issue #2).
+    const use_vectors = b.option(bool, "use-vectors", "Force the @Vector scan tier on or off (default: detect from the target CPU)");
+    const vec_size = b.option(u16, "vec-size", "Force the vector width in bytes (default: detect from the target CPU)");
+
+    const parser_options = b.addOptions();
+    parser_options.addOption(?bool, "use_vectors", use_vectors);
+    parser_options.addOption(?u16, "vec_size", vec_size);
+
     // Expose hparse as a public module.
     // This creates a "module", which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -28,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addOptions("build_options", parser_options);
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -39,6 +54,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // src/bench.zig reaches the parser with @import("root.zig"), so this module
+    // compiles it as well and needs the same options.
+    exe_mod.addOptions("build_options", parser_options);
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
@@ -105,12 +123,46 @@ pub fn build(b: *std.Build) void {
     // Fuzzing harness (see src/fuzz.zig and issue #2).
     // `zig build fuzz` replays the seed corpus through the oracles (regression mode);
     // `zig build fuzz --fuzz` runs coverage-guided fuzzing.
+
+    // A second copy of the parser with the @Vector tier forced off, so the
+    // path-differential oracle can run both tiers over the same input in one
+    // process.
+    //
+    // Unless this build is already the scalar one, in which case the shipped
+    // parser IS that tier and the oracle compares it with itself. That case has
+    // to be handled rather than just compiled twice: two option sets with
+    // identical contents generate one cached options.zig, and a single file
+    // cannot be the root of two modules.
+    const scalar_mod = if (use_vectors == false) lib_mod else blk: {
+        // `vec_size` is left to its default rather than inherited: with vectors off
+        // the SWAR loops measure in `block_size`, and a forced vector width would
+        // describe a tier this build does not contain.
+        const scalar_options = b.addOptions();
+        scalar_options.addOption(?bool, "use_vectors", false);
+        scalar_options.addOption(?u16, "vec_size", null);
+
+        // A generated copy, because Zig refuses to let one file root two modules
+        // ("files must belong to only one module"). src/root.zig imports nothing
+        // but std, builtin and build_options, so a copy of that one file is the
+        // whole parser.
+        const scalar_src = b.addWriteFiles().addCopyFile(b.path("src/root.zig"), "root_scalar.zig");
+
+        const mod = b.createModule(.{
+            .root_source_file = scalar_src,
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addOptions("build_options", scalar_options);
+        break :blk mod;
+    };
+
     const fuzz_mod = b.createModule(.{
         .root_source_file = b.path("src/fuzz.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hparse", .module = lib_mod },
+            .{ .name = "hparse_scalar", .module = scalar_mod },
         },
     });
 

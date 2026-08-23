@@ -22,6 +22,11 @@ attacker chose, on a thread that is also serving other connections.
   a StackTrace type mismatch under `-ffuzz`) does not apply. Run it for a few
   minutes on any change to the parser — it has found real bugs in about two
   minutes, twice.
+- `zig build test -Duse-vectors=false` — the same unit tests against the
+  SWAR/scalar tier. Nothing else reaches it: `std.simd.suggestVectorLength` is
+  non-null on every target this builds for (SSE2 on baseline x86_64, NEON on
+  aarch64), so before that option existed the scalar half of every
+  `if (comptime use_vectors)` was dead code in every test run.
 - `zig build bench` for anything on a scanning path. Compare bands across
   runs, never single numbers.
 
@@ -46,11 +51,27 @@ They are the reason to trust a change here, so know what they cover:
   `parseRequestResume`/`parseResponseResume` must reach the identical answer as
   one shot, AND must never accept a message the one-shot path refuses. The
   second half is the one that matters for a proxy and it is easy to leave out.
+- **Path differential.** A second build of the parser with the `@Vector` tier
+  forced off parses the same bytes and must reach the same verdict — including
+  *which* error. The tier is chosen by how many bytes remain, so the two builds
+  run different code over one input by construction; this parser has already
+  had one SIMD-vs-scalar divergence (a space in a header key). Injecting a
+  vector-only accept of DEL in a header value, the oracle catches it in about a
+  minute of `--fuzz`, and the corpus alone does not — the differential earns
+  its keep only under coverage-guided fuzzing.
 
 ## Invariants worth knowing before editing
 
 - **Never allocates, never copies.** Every returned slice points into the
   caller's buffer.
+- **The tier constants are build options, and default to detection.**
+  `-Duse-vectors=false` and `-Dvec-size=N` override `use_vectors` / `vec_size`
+  in `src/root.zig`; unset, they compute exactly what the hardcoded detection
+  used to. They exist for the tests, not for consumers — the detection is what
+  makes the parser fast on the machine it was built for. `build.zig` compiles a
+  second, vectors-off copy of `src/root.zig` for the fuzz harness to diff
+  against, via a generated copy of the file because Zig will not let one file
+  root two modules.
 - **`min_request_len` is a correctness argument, not a heuristic.** The
   shortest legal request, `A / HTTP/1.1\r\n\r\n`, is exactly 16 bytes, so the
   fast-path length check can never refuse a *complete* request — but only
