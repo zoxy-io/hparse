@@ -51,6 +51,16 @@ They are the reason to trust a change here, so know what they cover:
   `parseRequestResume`/`parseResponseResume` must reach the identical answer as
   one shot, AND must never accept a message the one-shot path refuses. The
   second half is the one that matters for a proxy and it is easy to leave out.
+- **Reference differential.** Where hparse and picohttpparser BOTH accept, every
+  field must match: consumed length, method, target, version, each header key
+  and value, and on the response side the status code and status message. Only where both accept — they disagree about what is legal by
+  design (picohttpparser takes a bare LF, an obs-fold line, a leading empty line
+  and any HTTP minor digit), and those verdict differences are triage material,
+  not failures. What it catches is the case self-consistency cannot: both
+  parsers agreeing a message is well-formed and then disagreeing about what it
+  says. The reference is the copy already vendored for the benchmarks, so there
+  is one picohttpparser in the repo, not two, and `bench/` is outside the
+  published package — the fuzz step only ever builds in-tree.
 - **Path differential.** A second build of the parser with the `@Vector` tier
   forced off parses the same bytes and must reach the same verdict — including
   *which* error. The tier is chosen by how many bytes remain, so the two builds

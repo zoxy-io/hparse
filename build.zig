@@ -160,11 +160,44 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/fuzz.zig"),
         .target = target,
         .optimize = optimize,
+        // For picohttpparser, below.
+        .link_libc = true,
         .imports = &.{
             .{ .name = "hparse", .module = lib_mod },
             .{ .name = "hparse_scalar", .module = scalar_mod },
         },
     });
+
+    // picohttpparser, as the reference parser for the differential oracle. It is
+    // the copy already vendored for the benchmarks rather than a second one.
+    //
+    // bench/ is deliberately outside this package's `paths`, so this path resolves
+    // only inside the repo. That is the only place the fuzz step is ever built: a
+    // consumer depending on hparse gets `src/` and builds `lib_mod`, never this.
+    //
+    // As its own library rather than C sources added to `fuzz_mod`, because
+    // `--fuzz` compiles that module with `-ffuzz` and the instrumentation reaches
+    // C too: the `__sanitizer_cov_trace_cmp*` callbacks clang then emits have no
+    // implementation in Zig's fuzzer runtime, and the link fails. Compiled
+    // separately, the reference parser is simply uninstrumented — the fuzzer gets
+    // no coverage feedback from inside it, which is right, since it is the
+    // yardstick and not the thing under test.
+    const pico_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    pico_mod.addCSourceFile(.{
+        .file = b.path("bench/picohttpparser/picohttpparser.c"),
+        .flags = &.{"-O2"},
+    });
+    const pico_lib = b.addLibrary(.{
+        .name = "picohttpparser",
+        .root_module = pico_mod,
+    });
+
+    fuzz_mod.addIncludePath(b.path("bench/picohttpparser"));
+    fuzz_mod.linkLibrary(pico_lib);
 
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,
