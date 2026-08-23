@@ -726,38 +726,25 @@ const Cursor = struct {
         }
     }
 
-    /// Parses HTTP headers into `headers`, beginning at index `start_index`.
+    /// Parses HTTP headers into `headers`.
     ///
     /// If the `headers` slice fills up before the terminating CRLF and another header
     /// follows, returns `error.TooManyHeaders` so the caller can retry with a larger slice.
     ///
-    /// On `error.Incomplete`, `count` holds the headers completed so far and
-    /// `resume_at` the offset of the first byte of the line that did not
-    /// finish. That offset is always a clean line boundary, because every
-    /// incomplete exit below happens either before a line is started or while
-    /// the cursor still sits on its first byte — which is what makes resuming
-    /// safe, and what turns a caller's retry loop from quadratic into linear.
-    inline fn parseHeaders(
-        cursor: *Cursor,
-        headers: []Header,
-        count: *usize,
-        start_index: usize,
-        resume_at: *usize,
-    ) ParseRequestError!void {
-        assert(start_index <= headers.len);
+    /// One-shot: on `error.Incomplete` the caller is expected to come back with
+    /// more bytes and start over. `parseHeadersResume` is the version that does
+    /// not start over.
+    inline fn parseHeaders(cursor: *Cursor, headers: []Header, count: *usize) ParseRequestError!void {
         assert(@intFromPtr(cursor.idx) >= @intFromPtr(cursor.start));
         assert(@intFromPtr(cursor.idx) <= @intFromPtr(cursor.end));
 
-        var i: usize = start_index;
+        var i: usize = 0;
         while (i < headers.len) : (i += 1) {
-            const line_start = cursor.offsetFromStart();
-
             // We need at least one byte to tell whether the header section has ended or
             // another header follows. Guard before dereferencing so we never read past the
             // end on a truncated request.
             if (cursor.current() == cursor.end) {
                 count.* = i;
-                resume_at.* = line_start;
                 return error.Incomplete;
             }
 
@@ -765,57 +752,200 @@ const Cursor = struct {
             // empty line ends it. A bare LF here falls through into
             // `parseHeader`, which rejects it as an invalid key character.
             if (cursor.char() == '\r') {
-                cursor.parseCrlf() catch |err| {
-                    if (err == error.Incomplete) {
-                        count.* = i;
-                        resume_at.* = line_start;
-                    }
-                    return err;
-                };
+                try cursor.parseCrlf();
                 // end of headers
                 count.* = i;
                 return;
             }
 
-            cursor.parseHeader(&headers[i]) catch |err| {
-                if (err == error.Incomplete) {
-                    count.* = i;
-                    resume_at.* = line_start;
-                }
-                return err;
-            };
+            try cursor.parseHeader(&headers[i]);
         }
 
         // Set count to highest.
         count.* = i;
 
-        // Captured once for both exits below. `parseCrlf` can stop between the
-        // CR and the LF, and an exit that does not report where it stopped
-        // leaves the caller's cursor on the PREVIOUS line — which then reads
-        // as "the header array is full again" and returns TooManyHeaders for a
-        // message that parses fine in one shot. A caller obeying the
-        // TooManyHeaders contract would retry with a bigger array, resume at
-        // the wrong index, and hand back a header slot it never wrote.
-        const tail_start = cursor.offsetFromStart();
-
         // The `headers` slice is full; we still need the terminating CRLF. Guard before
         // dereferencing so we never read past the end.
         if (cursor.current() == cursor.end) {
-            resume_at.* = tail_start;
             return error.Incomplete;
         }
 
         // We have to check for the ending CRLF, same as what we're doing at top.
         if (cursor.char() == '\r') {
-            cursor.parseCrlf() catch |err| {
-                if (err == error.Incomplete) resume_at.* = tail_start;
-                return err;
-            };
+            try cursor.parseCrlf();
             return;
         }
         // The `headers` slice is full and the next byte isn't the terminating CRLF.
         // If it's a valid header-key character, another header follows and the caller
         // needs a larger `headers` slice; otherwise the request is malformed.
+        if (isValidKeyChar(cursor.char())) {
+            return error.TooManyHeaders;
+        }
+        return error.Invalid;
+    }
+
+    /// One header line, resumable at the byte the last attempt reached.
+    ///
+    /// `parseHeader` above restarts at the line's first byte, which is why a
+    /// line-level resume cursor still costs `n * longest_line`. This one keeps
+    /// the scan position and which part of the line it was in, so no byte is
+    /// ever scanned twice and the total is linear in the head.
+    ///
+    /// Deliberately NOT shared with `parseHeader`: that one is the hot path
+    /// for callers who already have the whole head, and threading phase state
+    /// through it would put branches in the middle of the SIMD scans for the
+    /// benefit of callers who are not using it. The fuzz harness parses every
+    /// input both ways and requires identical results, which is a stronger
+    /// guard against drift than sharing the code would be.
+    ///
+    /// The partial header's key needs no storage here: it is written into the
+    /// caller's `headers[i]` the moment it is known, and that array is part of
+    /// the documented `Resume` contract.
+    inline fn parseHeaderResume(
+        cursor: *Cursor,
+        header: *Header,
+        state: *Resume,
+    ) ParseRequestError!void {
+        assert(state.scanned >= state.offset);
+        assert(@intFromPtr(cursor.start + state.scanned) <= @intFromPtr(cursor.end));
+
+        const line_start = state.offset;
+
+        if (state.phase == .key) {
+            cursor.idx = cursor.start + state.scanned;
+            cursor.matchHeaderKey();
+            if (cursor.current() == cursor.end) {
+                state.scanned = cursor.offsetFromStart();
+                // The single implication the loop above rests on: a key that
+                // stopped short leaves `scanned` STRICTLY past the line start,
+                // which is how the next call tells a resumed line from a fresh
+                // one. If these were ever equal the line would restart and its
+                // key would be truncated to nothing.
+                assert(state.scanned > state.offset);
+                return error.Incomplete;
+            }
+            const key_end = cursor.offsetFromStart();
+            if (cursor.char() != ':') return error.Invalid;
+            // A zero-length header key is invalid.
+            if (key_end == line_start) return error.Invalid;
+
+            header.key = (cursor.start + line_start)[0 .. key_end - line_start];
+            cursor.advance(1);
+            state.phase = .ows;
+            state.scanned = cursor.offsetFromStart();
+        }
+
+        if (state.phase == .ows) {
+            cursor.idx = cursor.start + state.scanned;
+            // Trim leading optional whitespace (OWS = SP / HTAB) per RFC 7230.
+            while (cursor.end - cursor.current() > 0 and
+                (cursor.char() == ' ' or cursor.char() == '\t')) : (cursor.advance(1))
+            {}
+            if (cursor.current() == cursor.end) {
+                // More OWS may follow, so the value has not started yet.
+                state.scanned = cursor.offsetFromStart();
+                return error.Incomplete;
+            }
+            state.phase = .value;
+            state.value_start = cursor.offsetFromStart();
+            state.scanned = state.value_start;
+            assert(state.value_start >= state.offset);
+        }
+
+        if (state.phase == .value) {
+            cursor.idx = cursor.start + state.scanned;
+            cursor.matchHeaderValue();
+            if (cursor.current() == cursor.end) {
+                state.scanned = cursor.offsetFromStart();
+                return error.Incomplete;
+            }
+            state.value_end = cursor.offsetFromStart();
+            state.phase = .crlf;
+            // `scanned` means "validated up to here", so it follows the value
+            // rather than being left behind at its start — otherwise the field
+            // is a lie and the linearity bound loosens for chunked arrival.
+            state.scanned = state.value_end;
+        }
+
+        assert(state.phase == .crlf);
+        assert(state.value_end >= state.value_start);
+        cursor.idx = cursor.start + state.value_end;
+        // Only CRLF ends the value (strict; bare LF is invalid).
+        try cursor.parseCrlf();
+
+        // Trim trailing optional whitespace per RFC 7230
+        // (field-value = OWS field-content OWS).
+        var value = (cursor.start + state.value_start)[0 .. state.value_end - state.value_start];
+        while (value.len > 0 and (value[value.len - 1] == ' ' or value[value.len - 1] == '\t')) {
+            value.len -= 1;
+        }
+        header.value = value;
+
+        // Ready for the next line.
+        state.phase = .key;
+        state.value_start = 0;
+        state.value_end = 0;
+    }
+
+    /// `parseHeaders`, resumable to the byte. Mirrors the loop above, with the
+    /// line-boundary bookkeeping replaced by `state`.
+    inline fn parseHeadersResume(
+        cursor: *Cursor,
+        headers: []Header,
+        count: *usize,
+        state: *Resume,
+    ) ParseRequestError!void {
+        assert(state.header_count <= headers.len);
+        assert(state.offset <= state.scanned);
+
+        var i: usize = state.header_count;
+        while (i < headers.len) : (i += 1) {
+            // A FRESH line, as opposed to one being resumed mid-key: nothing
+            // of it has been scanned yet. The distinction matters because
+            // `offset` is the line's first byte and `parseHeaderResume` takes
+            // the key from there — advancing it to the scan position would
+            // silently truncate the key to nothing.
+            if (state.phase == .key and state.scanned == state.offset) {
+                if (cursor.start + state.offset == cursor.end) {
+                    count.* = i;
+                    return error.Incomplete;
+                }
+                cursor.idx = cursor.start + state.offset;
+                // Only the strict CRLF empty line ends the header section.
+                if (cursor.char() == '\r') {
+                    cursor.parseCrlf() catch |err| {
+                        if (err == error.Incomplete) count.* = i;
+                        return err;
+                    };
+                    count.* = i;
+                    return;
+                }
+            }
+
+            cursor.parseHeaderResume(&headers[i], state) catch |err| {
+                if (err == error.Incomplete) {
+                    count.* = i;
+                    state.header_count = i;
+                }
+                return err;
+            };
+            // The line finished; the next one starts here.
+            state.offset = cursor.offsetFromStart();
+            state.scanned = state.offset;
+            state.header_count = i + 1;
+        }
+
+        count.* = i;
+        // Every line completed, so the two agree and the tail begins here.
+        assert(state.offset == state.scanned);
+
+        const tail_start = state.offset;
+        if (cursor.start + tail_start == cursor.end) return error.Incomplete;
+        cursor.idx = cursor.start + tail_start;
+        if (cursor.char() == '\r') {
+            try cursor.parseCrlf();
+            return;
+        }
         if (isValidKeyChar(cursor.char())) {
             return error.TooManyHeaders;
         }
@@ -1002,8 +1132,7 @@ pub fn parseRequest(
     // parse the HTTP version
     try cursor.parseVersion(version);
     // parse HTTP headers
-    var resume_at: usize = 0;
-    try cursor.parseHeaders(headers, header_count, 0, &resume_at);
+    try cursor.parseHeaders(headers, header_count);
 
     // Return the total consumed length to caller.
     return cursor.current() - cursor.start;
@@ -1029,8 +1158,11 @@ pub fn parseRequest(
 ///
 /// The other out-parameters are equally caller-owned across calls:
 ///
-/// * `headers` must be the SAME array, with `headers[0..header_count]` intact.
-///   Those slots are not rewritten.
+/// * `headers` must be the SAME array, with `headers[0..header_count]` intact
+///   — those slots are not rewritten — AND `headers[header_count]` untouched
+///   while a parse is in flight. The key of a half-parsed line is written
+///   there as soon as it is known and its value is attached calls later, so
+///   clearing or reusing that slot between calls corrupts the header.
 /// * `method`, `method_token`, `path` and `version` (or `version`,
 ///   `status_code`, `status_msg`) are written ONCE, by whichever call finishes
 ///   the request or status line — `line_done` is what records that. The final
@@ -1047,6 +1179,18 @@ pub const Resume = struct {
     header_count: usize = 0,
     /// The request or status line is parsed; only headers remain.
     line_done: bool = false,
+    /// Which part of the header line at `offset` the scan stopped in.
+    phase: Phase = .key,
+    /// How far the scan has already validated. Never less than `offset`, and
+    /// the reason no byte is scanned twice: a partial line resumes here rather
+    /// than at its first byte.
+    scanned: usize = 0,
+    /// Bounds of the value of the line being parsed, once they are known.
+    value_start: usize = 0,
+    value_end: usize = 0,
+
+    /// Where inside one header line a partial parse stopped.
+    pub const Phase = enum { key, ows, value, crlf };
 };
 
 /// `parseRequest`, resumable. Identical results, linear total work.
@@ -1070,6 +1214,27 @@ pub fn parseRequestResume(
     // off the buffer. So it is an error, not an assertion: assertions are gone
     // in the ReleaseFast build a consumer is free to choose.
     if (state.offset > slice.len) return error.Invalid;
+    // `scanned` is caller state too, and the parser relies on it never
+    // trailing `offset` (that is what tells a fresh line from a resumed one)
+    // and never running past the slice. Both are refused rather than asserted,
+    // for the same reason: assertions are gone in ReleaseFast.
+    if (state.scanned < state.offset) return error.Invalid;
+    if (state.scanned > slice.len) return error.Invalid;
+    // `phase`, `value_start` and `value_end` are public fields too, and the
+    // `.crlf` path indexes straight through them: `cursor.start + value_end`,
+    // and a `value_end` below `value_start` underflows the recorded length to
+    // ~0 and walks the trim loop off the buffer. Same reasoning as above —
+    // these are errors because assertions are not there in ReleaseFast.
+    // Each bound is checked by the phase that actually reads it: `.ows` has
+    // not found the value yet, and only `.crlf` indexes through `value_end`.
+    if (state.phase == .value or state.phase == .crlf) {
+        if (state.value_start < state.offset) return error.Invalid;
+        if (state.value_start > slice.len) return error.Invalid;
+    }
+    if (state.phase == .crlf) {
+        if (state.value_end < state.value_start) return error.Invalid;
+        if (state.value_end > slice.len) return error.Invalid;
+    }
     assert(state.header_count <= headers.len);
     if (!state.line_done) assert(state.header_count == 0);
 
@@ -1088,14 +1253,13 @@ pub fn parseRequestResume(
         try cursor.parseVersion(version);
         state.line_done = true;
         state.offset = cursor.offsetFromStart();
+        // The header scan starts where the line ended; `scanned` never trails
+        // `offset`, and the first header line has nothing scanned yet.
+        state.scanned = state.offset;
     }
 
     return resumeHeaders(&cursor, state, slice.len, headers, header_count);
 }
-
-/// Never a valid resume point, so "parseHeaders did not report one" is
-/// distinguishable from "it reported the value we happened to seed".
-const resume_unset = std.math.maxInt(usize);
 
 /// The header phase of a resumable parse.
 ///
@@ -1112,19 +1276,13 @@ fn resumeHeaders(
 ) ParseRequestError!usize {
     assert(state.line_done);
 
-    var resume_at: usize = resume_unset;
-    cursor.parseHeaders(headers, header_count, state.header_count, &resume_at) catch |err| {
+    const before = state.scanned;
+    cursor.parseHeadersResume(headers, header_count, state) catch |err| {
         if (err == error.Incomplete) {
-            // Every incomplete exit reports where it stopped. Seeding with a
-            // sentinel rather than `state.offset` is what makes a missed
-            // report an assertion failure instead of a silent rewind to the
-            // previous line — which is how the tail-block exit hid.
-            assert(resume_at != resume_unset);
-            assert(resume_at >= state.offset); // never rewinds
-            assert(resume_at <= slice_len);
-
-            state.offset = resume_at;
-            state.header_count = header_count.*;
+            // The scan never rewinds and never runs past what it was given.
+            assert(state.scanned >= before);
+            assert(state.scanned <= slice_len);
+            assert(state.offset <= state.scanned);
         }
         return err;
     };
@@ -1169,8 +1327,7 @@ pub fn parseResponse(
     try cursor.parseResponseLine(version, status_code, status_msg);
 
     // Parse headers.
-    var resume_at: usize = 0;
-    try cursor.parseHeaders(headers, header_count, 0, &resume_at);
+    try cursor.parseHeaders(headers, header_count);
 
     // Return the total consumed length to caller.
     return cursor.current() - cursor.start;
@@ -1193,6 +1350,27 @@ pub fn parseResponseResume(
     // off the buffer. So it is an error, not an assertion: assertions are gone
     // in the ReleaseFast build a consumer is free to choose.
     if (state.offset > slice.len) return error.Invalid;
+    // `scanned` is caller state too, and the parser relies on it never
+    // trailing `offset` (that is what tells a fresh line from a resumed one)
+    // and never running past the slice. Both are refused rather than asserted,
+    // for the same reason: assertions are gone in ReleaseFast.
+    if (state.scanned < state.offset) return error.Invalid;
+    if (state.scanned > slice.len) return error.Invalid;
+    // `phase`, `value_start` and `value_end` are public fields too, and the
+    // `.crlf` path indexes straight through them: `cursor.start + value_end`,
+    // and a `value_end` below `value_start` underflows the recorded length to
+    // ~0 and walks the trim loop off the buffer. Same reasoning as above —
+    // these are errors because assertions are not there in ReleaseFast.
+    // Each bound is checked by the phase that actually reads it: `.ows` has
+    // not found the value yet, and only `.crlf` indexes through `value_end`.
+    if (state.phase == .value or state.phase == .crlf) {
+        if (state.value_start < state.offset) return error.Invalid;
+        if (state.value_start > slice.len) return error.Invalid;
+    }
+    if (state.phase == .crlf) {
+        if (state.value_end < state.value_start) return error.Invalid;
+        if (state.value_end > slice.len) return error.Invalid;
+    }
     assert(state.header_count <= headers.len);
     if (!state.line_done) assert(state.header_count == 0);
 
@@ -1209,6 +1387,9 @@ pub fn parseResponseResume(
         try cursor.parseResponseLine(version, status_code, status_msg);
         state.line_done = true;
         state.offset = cursor.offsetFromStart();
+        // The header scan starts where the line ended; `scanned` never trails
+        // `offset`, and the first header line has nothing scanned yet.
+        state.scanned = state.offset;
     }
 
     return resumeHeaders(&cursor, state, slice.len, headers, header_count);
@@ -1669,19 +1850,6 @@ test "parseRequest: full headers slice with more headers returns TooManyHeaders"
 // ---------------------------------------------------------------------------
 // resume
 
-/// The longest CRLF-terminated line in `wire`, which is what bounds the
-/// re-scanning a line-level resume cursor still does.
-fn longestLine(wire: []const u8) usize {
-    var longest: usize = 1;
-    var start: usize = 0;
-    for (wire, 0..) |byte, i| {
-        if (byte != '\n') continue;
-        longest = @max(longest, i + 1 - start);
-        start = i + 1;
-    }
-    return longest;
-}
-
 /// Feeds `wire` one byte at a time through `parseRequestResume`, and returns
 /// the total number of bytes the parser was asked to look at.
 ///
@@ -1706,7 +1874,10 @@ fn driveRequestByteAtATime(
         have += 1;
         // Bytes this call can possibly look at: everything past the resume
         // point. With no resume cursor this would be `have` every time.
-        examined += have - state.offset;
+        // What the parser will actually look at: everything past the point the
+        // scan already reached. Before intra-line resume this was `state.offset`
+        // — the start of the LINE — which is precisely the difference.
+        examined += have - state.scanned;
         if (parseRequestResume(
             wire[0..have],
             &state,
@@ -1778,14 +1949,17 @@ test "resume: byte-at-a-time equals one-shot, for requests" {
 
     // The property this API exists for, stated exactly.
     //
-    // Re-parsing from byte zero costs n*(n+1)/2. A LINE-level resume cursor
-    // costs, for each byte, the distance back to the start of the line it is
-    // in — so the bound is `n * longest_line`, not `n * n`. That is the real
-    // complexity and it is what gets asserted; claiming plain linearity here
-    // would be claiming intra-line resume, which this does not do.
+    // Re-parsing from byte zero costs n*(n+1)/2. The resume cursor keeps both
+    // the line it is on AND how far into that line the scan reached, so no
+    // byte is ever scanned twice: the total is LINEAR in the head, with a
+    // small constant for the per-call bookkeeping.
     const quadratic = wire.len * (wire.len + 1) / 2;
-    try testing.expect(examined <= wire.len * longestLine(wire));
-    try testing.expect(examined < quadratic / 2);
+    try testing.expect(examined < quadratic / 8);
+    // The request line has no interior resume point, so it is re-read until it
+    // completes: that is line_len^2/2, paid once. Everything after it is read
+    // exactly once plus one byte of look-ahead per call.
+    const line_len = std.mem.indexOf(u8, wire, "\r\n").? + 2;
+    try testing.expect(examined <= line_len * line_len + 2 * wire.len);
 }
 
 test "resume: byte-at-a-time equals one-shot, for responses" {
@@ -1817,7 +1991,10 @@ test "resume: byte-at-a-time equals one-shot, for responses" {
     var have: usize = 0;
     while (have < wire.len) {
         have += 1;
-        examined += have - state.offset;
+        // What the parser will actually look at: everything past the point the
+        // scan already reached. Before intra-line resume this was `state.offset`
+        // — the start of the LINE — which is precisely the difference.
+        examined += have - state.scanned;
         if (parseResponseResume(
             wire[0..have],
             &state,
@@ -1844,14 +2021,19 @@ test "resume: byte-at-a-time equals one-shot, for responses" {
         try testing.expectEqualStrings(a.key, b.key);
         try testing.expectEqualStrings(a.value, b.value);
     }
-    try testing.expect(examined <= wire.len * longestLine(wire));
+    const line_len = std.mem.indexOf(u8, wire, "\r\n").? + 2;
+    try testing.expect(examined <= line_len * line_len + 2 * wire.len);
 }
 
 test "resume: every segmentation reaches the same answer" {
     // Not just byte-at-a-time: the resume point must be right for any split,
     // including ones that land inside a header name, inside a value, and
     // between the CR and the LF of a line terminator.
-    const wire = "POST /submit HTTP/1.1\r\nhost: h\r\ncontent-length: 4\r\nx-b: vv\r\n\r\n";
+    // The OWS forms matter: leading SP+HTAB runs are what exercise the `.ows`
+    // phase across a buffer boundary, and trailing OWS is trimmed from the
+    // recorded value after the scan has already crossed one.
+    const wire = "POST /submit HTTP/1.1\r\nhost: h\r\nx-a: \t  vv  \t\r\n" ++
+        "content-length: 4\r\nx-b:\r\nx-c:\tw\r\n\r\n";
 
     var expected_headers: [8]Header = undefined;
     var expected_method: Method = .unknown;
@@ -2145,9 +2327,27 @@ test "resume: an out-of-range offset is refused rather than trusted" {
         &count,
     ));
 
+    // An inconsistent pair is refused too: `scanned` behind `offset` is what
+    // distinguishes a fresh line from a resumed one, so a hand-built state
+    // that gets it wrong would silently reparse a line from the wrong byte.
+    var skewed: Resume = .{ .offset = 4, .scanned = 2, .line_done = true };
+    try testing.expectError(error.Invalid, parseResponseResume(
+        response,
+        &skewed,
+        &rversion,
+        &status,
+        &msg,
+        &headers,
+        &count,
+    ));
+
     // And the boundary is inclusive: an offset EQUAL to the length is a
     // legitimate "everything so far is consumed, waiting for more".
-    var edge: Resume = .{ .offset = response.len, .line_done = true };
+    var edge: Resume = .{
+        .offset = response.len,
+        .scanned = response.len,
+        .line_done = true,
+    };
     try testing.expectError(error.Incomplete, parseResponseResume(
         response,
         &edge,
