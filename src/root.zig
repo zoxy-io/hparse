@@ -9,9 +9,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
-const comptimePrint = std.fmt.comptimePrint;
 
 /// Block size of the CPU.
 const block_size = @sizeOf(usize);
