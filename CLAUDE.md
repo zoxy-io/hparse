@@ -128,6 +128,30 @@ import was cheap, and the reason a corpus from any other parser would be too.
   smuggling starts: two intermediaries that disagree about where a line ends
   parse two different messages out of the same bytes. RFC 9112 §2.2 permits
   the leniency; a proxy-grade parser must not take it.
+- **The header-key scan is scalar on purpose, and it is the fast one.**
+  `matchHeaderKey` walks `key_map` a byte at a time while `matchPath` and
+  `matchHeaderValue` vectorize. That looks like an oversight and is not. A field
+  name is `token` (RFC 9110 §5.6.2), and tchar is not a range, so a vector path
+  has to classify it exactly — six wrapping subtract-and-compare ranges plus
+  three equalities, since Zig exposes no portable runtime byte shuffle and
+  `@shuffle` needs a comptime mask. Measured on the `bench/` request at
+  `-Diters=10000000`, 11 interleaved runs, comparing minima: that exact vector
+  path is **1.24x slower** than the broken range compare it replaced, while the
+  scalar loop is **0.85x** — faster than the code it replaced, while also being
+  correct. Header keys are short, so a 16-byte-wide setup never amortizes;
+  re-measured with 40-byte keys, where SIMD should win if it ever does, and it
+  still loses. Those ratios are **not reproducible from the tree** — the variant
+  is deleted and nothing in `bench/` isolates this function — so they are the
+  reason the code looks like this, not a number to re-run. picohttpparser and
+  httparse both scan field names byte at a time for the same reason. Reach for
+  SIMD here again only with your own benchmark.
+- **The path-differential oracle no longer covers header keys.** It diffs a
+  vectors-on build against a vectors-off one, and `matchHeaderKey` is now the
+  same code in both. That is worth knowing precisely because both bugs this
+  function has had — the space-in-key tier split and the tchar gap — lived
+  there. Vectorizing it again would restore that coverage; leaving it scalar
+  means header-key classification rests on the unit test that walks all 256
+  bytes, and on the reference differentials.
 - **There are two header parsers on purpose.** `parseHeader`/`parseHeaders`
   are the one-shot hot path for a caller holding a whole head;
   `parseHeaderResume`/`parseHeadersResume` carry the resume state. Threading

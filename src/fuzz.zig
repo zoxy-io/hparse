@@ -183,6 +183,13 @@ fn expectResumeRejects(g: []const u8) !void {
 /// and `Invalid` from the other is two parsers disagreeing about whether a message
 /// exists, which for a proxy is the whole bug class.
 ///
+/// KNOWN GAP: header KEYS are no longer covered. `matchHeaderKey` is byte-at-a-time
+/// in both builds now (see its comment in `root.zig` for why), so for key bytes this
+/// oracle compares one implementation with itself. That is doubly worth knowing
+/// because the divergence named above — and the tchar bug found later in the same
+/// function — both lived exactly there. Nothing in this harness now watches header
+/// keys for a tier split, because there are no longer two tiers to split.
+///
 /// The scalar build parses the guarded copy too, so its SWAR loops and scalar tails
 /// get the memory-safety oracle rather than only the vector ones.
 ///
@@ -246,10 +253,11 @@ fn diffRequestTiers(
 /// `diffRequestTiers` for the response side.
 ///
 /// Nothing in the status line is vectorized — `matchStatusMessage` is a byte-at-a-time
-/// loop, and the only `@Vector` scans in the parser are `matchPath`, `matchHeaderKey`
-/// and `matchHeaderValue`. What this diffs is therefore the two header scans reached
-/// through `parseResponse`, whose surrounding state differs from the request path's,
-/// plus the whole response line under both builds' guard-page copy.
+/// loop, and the only `@Vector` scans left in the parser are `matchPath` and
+/// `matchHeaderValue`. `matchHeaderKey` used to be a third and is not any more. What
+/// this diffs is therefore the header-value scan reached through `parseResponse`,
+/// whose surrounding state differs from the request path's, plus the whole response
+/// line under both builds' guard-page copy.
 fn diffResponseTiers(
     g: []const u8,
     vector_result: hparse.ParseRequestError!usize,

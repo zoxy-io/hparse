@@ -500,39 +500,31 @@ const Cursor = struct {
         try cursor.parseCrlf();
     }
 
-    /// Validates header keys.
-    /// Prefers SSE (128-bits) instead since header keys are rather small.
+    /// Validates header keys, one byte at a time against `key_map`.
+    ///
+    /// Deliberately NOT vectorized, unlike every other scan in this parser. A
+    /// vector path here has to classify tchar exactly, and tchar is not a range —
+    /// the old `chunk > ' '` range compare is precisely what let all 144 non-tchar
+    /// bytes through. Without a runtime byte shuffle (Zig exposes none portably, and
+    /// `@shuffle` needs a comptime mask) an exact classifier costs six wrapping
+    /// subtract-and-compare ranges plus three equalities, roughly 32 SSE2
+    /// instructions per 16 bytes against the old six.
+    ///
+    /// That exact vector path was written and measured before being thrown away.
+    /// Against the broken range compare it replaced, on the `bench/` request at
+    /// `-Diters=10000000`, 11 interleaved runs on an Intel Core Ultra 7 258V,
+    /// comparing minima: exact-vector 1.24x SLOWER, this loop 0.85x — faster than
+    /// the code it replaces, while also being correct. Header keys are short (the
+    /// benchmark's longest is 15 bytes), so a 16-byte-wide setup never pays for
+    /// itself. Re-checked with 40-byte keys, where the vector path should win if it
+    /// ever does: it still does not.
+    ///
+    /// Those ratios are not reproducible from this tree — the variant they describe
+    /// is deleted, and `bench/` has no target that isolates this function. Treat
+    /// them as the reason the code looks like this, not as a measurement you can
+    /// re-run. picohttpparser and httparse both scan field names byte-at-a-time for
+    /// the same reason. If you reach for SIMD here again, bring your own numbers.
     inline fn matchHeaderKey(cursor: *Cursor) void {
-        if (comptime use_vectors) {
-            const sse_vec_size = 16;
-            const Vec = @Vector(sse_vec_size, u8);
-            const Int = std.meta.Int(.unsigned, sse_vec_size);
-
-            while (cursor.hasLength(sse_vec_size)) {
-                const spaces: Vec = @splat(' ');
-                const colons: Vec = @splat(':');
-                const deletes: Vec = @splat(0x7f);
-
-                const chunk = cursor.asVector(sse_vec_size);
-
-                const bits = @intFromBool(chunk > spaces) & ~(@intFromBool(chunk == colons) | @intFromBool(chunk == deletes));
-
-                const adv_by = @ctz(~@as(Int, @bitCast(bits)));
-
-                // advance the cursor
-                cursor.advance(adv_by);
-
-                // chunk includes an invalid char or CRLF, we're done
-                if (adv_by != sse_vec_size) {
-                    return;
-                }
-            }
-        }
-
-        // NOTE: SWAR is not preferred here, this might change in the future
-        // but honestly header keys are not so long.
-
-        // fallback for len < 16
         while (cursor.end - cursor.idx > 0) : (cursor.advance(1)) {
             if (!isValidKeyChar(cursor.char())) {
                 return;
@@ -1036,17 +1028,21 @@ inline fn isValidPathChar(c: u8) bool {
     return path_map[c] != 0;
 }
 
-/// Table of valid header key characters.
+/// Table of valid header key characters — the same token (tchar) set as
+/// `method_map`, because RFC 9110 §5.6.2 gives field names and methods the same
+/// grammar. A field name is `token`, and `token` is `1*tchar`.
 ///
-/// NOTE: space (' ', 0x20) must be listed as invalid so the scalar fallback agrees with
-/// the SIMD path in `matchHeaderKey` (which stops at any byte <= space). Otherwise a key
-/// containing a space would be accepted or rejected depending on how many bytes remain.
-const key_map = createCharMap(.{
-    // Invalid characters.
-    0,   1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,  16,
-    17,  18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, ' ', ':',
-    127,
-});
+/// This is a positive table on purpose. Listing what is *invalid* is how this
+/// table came to accept 144 bytes it should not have: the separators
+/// `"(),/;<=>?@[\]{}` and every byte 0x80-0xff, none of which are tchar. A proxy
+/// that hands a backend a field name the backend parses differently is the same
+/// smuggling shape as disagreeing about a line terminator, so this is not a
+/// cosmetic conformance point.
+///
+/// This table is now the only thing that decides a key character — `matchHeaderKey`
+/// consults it byte by byte and has no vector path to keep in sync. See the comment
+/// there for why, and for the measurement behind it.
+const key_map: [256]u1 = method_map;
 
 /// Checks if a given character is a valid header key character.
 inline fn isValidKeyChar(c: u8) bool {
@@ -1778,12 +1774,16 @@ test "parseRequest: truncated inputs return Incomplete" {
 }
 
 test "parseRequest: space in header key is rejected regardless of match path" {
-    // The same key "A B" must be rejected whether the SIMD matcher (>= 16 bytes remaining)
-    // or the scalar fallback (< 16 bytes) runs. Before `key_map` listed space as invalid,
-    // the scalar path accepted "A B" while the SIMD path rejected it.
+    // Historical: `matchHeaderKey` had a SIMD path chosen by how many bytes remained,
+    // and before `key_map` listed space as invalid the scalar path accepted "A B"
+    // while the SIMD path rejected it. Both lengths now run the same byte-at-a-time
+    // loop, so this no longer probes two tiers — kept because the input is still the
+    // one that exposed the split, and because the resolution to that split (making
+    // the table agree with the SIMD range compare rather than with RFC 9110) is what
+    // later admitted 144 non-tchar bytes. See the tchar test below.
     const reqs = [_][]const u8{
-        "GET / HTTP/1.1\r\nA B: v\r\n\r\n", // short tail -> scalar matchHeaderKey
-        "GET / HTTP/1.1\r\nA B: valuevaluevaluevalue\r\n\r\n", // long tail -> SIMD matchHeaderKey
+        "GET / HTTP/1.1\r\nA B: v\r\n\r\n", // short tail
+        "GET / HTTP/1.1\r\nA B: valuevaluevaluevalue\r\n\r\n", // long tail
     };
 
     for (reqs) |req| {
@@ -1798,6 +1798,45 @@ test "parseRequest: space in header key is rejected regardless of match path" {
             error.Invalid,
             parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count),
         );
+    }
+}
+
+test "parseRequest: a header key is exactly tchar, for every byte" {
+    // `key_map` used to be written as a list of what is invalid — controls, space,
+    // colon, DEL — which quietly admitted 144 bytes that are not tchar: the RFC 9110
+    // separators `"(),/;<=>?@[\]{}` and all of 0x80-0xff. A field name a backend
+    // parses differently is the same smuggling shape as disagreeing about a line
+    // terminator, so this walks all 256 rather than spot-checking the ones that
+    // happened to be found.
+    //
+    // Both padding lengths matter: `matchHeaderKey` had a vector path chosen by how
+    // many bytes remained, and this parser has already shipped one key-scan bug that
+    // only one of the two tiers had. The vector path is gone, but the case that
+    // exposed the split is worth keeping.
+    const tchar = "!#$%&'*+-.^_`|~0123456789" ++
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    for ([_][]const u8{ "A", "A" ** 24 }) |pad| {
+        for (0..256) |c| {
+            const byte: u8 = @intCast(c);
+
+            var buf: [96]u8 = undefined;
+            const req = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\n{s}{c}{s}: v\r\n\r\n", .{ pad, byte, pad });
+
+            var method: Method = .unknown;
+            var method_token: ?[]const u8 = null;
+            var path: ?[]const u8 = null;
+            var version: Version = .@"1.0";
+            var headers: [8]Header = undefined;
+            var header_count: usize = 0;
+
+            const parsed = if (parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count)) |_| true else |_| false;
+            // A colon does not make the parse fail, it ends the key early — so the
+            // key surviving whole is what "this byte is legal in a key" means.
+            const accepted = parsed and header_count == 1 and headers[0].key.len == pad.len * 2 + 1;
+
+            try testing.expectEqual(std.mem.indexOfScalar(u8, tchar, byte) != null, accepted);
+        }
     }
 }
 

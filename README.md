@@ -33,10 +33,10 @@ Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per 
 ```
 name                    min       mean        max      rel
 ----------------------------------------------------------
-hparse               0.104s     0.106s     0.110s    1.00x
-picohttpparser       0.123s     0.128s     0.132s    1.18x
-llhttp               0.229s     0.242s     0.252s    2.21x
-std.http             0.711s     0.717s     0.725s    6.87x
+hparse               0.084s     0.088s     0.100s    1.00x
+picohttpparser       0.116s     0.125s     0.132s    1.37x
+llhttp               0.236s     0.242s     0.272s    2.80x
+std.http             0.702s     0.704s     0.706s    8.35x
 ```
 
 For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
