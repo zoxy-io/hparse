@@ -8,6 +8,7 @@
 //! leniency; a proxy-grade parser must not take it).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const assert = std.debug.assert;
 
@@ -51,6 +52,13 @@ comptime {
     // `VectorInt` is a bit per lane and `@ctz` reads it as the advance, so a width
     // that is not a power of two would silently mis-index the buffer.
     if (!std.math.isPowerOfTwo(vec_size)) @compileError("vec_size must be a power of two");
+
+    // `firstRejected`'s nibble path pairs lanes into `@Vector(vec_size / 2, u16)`,
+    // so a width of one has nowhere to put them. Said here, next to the other
+    // constraint on this value, because the alternative is a `-Dvec-size=1` build
+    // failing on a bitcast size mismatch three frames down with nothing in the
+    // message about the width being the problem.
+    if (vec_size < 2) @compileError("vec_size must be at least two");
 }
 
 /// Which scan tier this build compiled. Exposed so the fuzz harness can prove the
@@ -126,6 +134,56 @@ const min_request_len = 0x10;
 /// * `error.TooManyHeaders` — the provided `headers` slice was too small; caller can
 ///   retry with a larger slice.
 pub const ParseRequestError = error{ Incomplete, Invalid, TooManyHeaders };
+
+/// Whether this build's mask extraction has to work around a missing `pmovmskb`;
+/// see `firstRejected`.
+///
+/// Little-endian only, and `.aarch64_be` is deliberately absent. Both mask forms
+/// read the first rejected lane as the lowest set bit, which is a statement about
+/// lane-to-byte order that only holds little-endian — so a big-endian build stays
+/// on the path it was already taking rather than moving to one nobody has run.
+const is_aarch64 = builtin.cpu.arch == .aarch64;
+
+/// Index of the first rejected lane in `bad`, or `vec_size` when every lane is
+/// accepted — the scan primitive every vectorized loop below is built on.
+///
+/// Two lowerings, because the two targets disagree about what a lane mask costs.
+/// x86 has `pmovmskb`: one instruction for a bit per lane, so bitcasting the
+/// compare result straight to an integer is already optimal. AArch64 has no such
+/// instruction, and LLVM lowers `@bitCast(@Vector(N, u1))` into
+/// `and`/`ext`/`zip1`/`addv` — a horizontal reduction, and it sits in the middle
+/// of a loop-carried dependency chain, since the next chunk's address is what the
+/// reduction produces. `shrn` narrowing each pair of 16-bit lanes down four bits
+/// leaves one nibble per input byte in a single 64-bit register, in one
+/// instruction and one v->x move. Measured on the `bench/` request, M3 Max, five
+/// interleaved runs comparing minima: 162-168 -> 130-133 ns/parse, three quarters
+/// of the gap against picohttpparser (122-123).
+///
+/// Do not collapse the two branches. The nibble form on x86 costs a `psrlw` and a
+/// `pshufb` on top of the `pmovmskb` it cannot avoid, and the bit form on AArch64
+/// costs the reduction above.
+inline fn firstRejected(bad: @Vector(vec_size, bool)) usize {
+    const adv_by = if (comptime is_aarch64) blk: {
+        const Vec = @Vector(vec_size, u8);
+        const Half = @Vector(vec_size / 2, u16);
+        const Narrow = @Vector(vec_size / 2, u8);
+        const NibbleMask = std.meta.Int(.unsigned, vec_size * 4);
+
+        const bytes: Vec = @select(u8, bad, @as(Vec, @splat(0xff)), @as(Vec, @splat(0)));
+        const nibbles: NibbleMask = @bitCast(@as(Narrow, @truncate(@as(Half, @bitCast(bytes)) >> @as(Half, @splat(4)))));
+
+        // Four mask bits per input byte, so the tail count divides by four. An
+        // all-accepted chunk gives zero, whose @ctz is the full width: exactly
+        // `vec_size`, the same "consumed everything" answer as the bit form.
+        break :blk @ctz(nibbles) >> 2;
+    } else @ctz(@as(VectorInt, @bitCast(@as(@Vector(vec_size, u1), @intFromBool(bad)))));
+
+    // Every caller feeds this straight to `Cursor.advance`, which does not check
+    // bounds — so the one place both lowerings meet is the place to say that
+    // neither can hand out an advance past the chunk it was given.
+    assert(adv_by <= vec_size);
+    return adv_by;
+}
 
 /// Helper for wandering around & parsing things along the way.
 const Cursor = struct {
@@ -368,7 +426,6 @@ const Cursor = struct {
     inline fn matchPath(cursor: *Cursor) void {
         if (comptime use_vectors) {
             const Vec = @Vector(vec_size, u8);
-            const Mask = @Vector(vec_size, u1);
 
             while (cursor.hasLength(vec_size)) {
                 const chunk = cursor.asVector(vec_size);
@@ -378,21 +435,21 @@ const Cursor = struct {
                 // byte above 0x7e is already large, so both bounds fall out of the
                 // same test — including every byte from 0x80 up, which the old
                 // `chunk > ' '` let straight through.
-                var bad: Mask = @intFromBool((chunk -% @as(Vec, @splat(0x21))) > @as(Vec, @splat(0x5d)));
+                var bad: @Vector(vec_size, bool) = (chunk -% @as(Vec, @splat(0x21))) > @as(Vec, @splat(0x5d));
 
                 // `{ | }` are contiguous, so one range covers them.
-                bad |= @intFromBool((chunk -% @as(Vec, @splat('{'))) <= @as(Vec, @splat(2)));
+                bad |= (chunk -% @as(Vec, @splat('{'))) <= @as(Vec, @splat(2));
 
                 // The rest are isolated by pchar neighbours — `=` sits between `<`
                 // and `>`, `_` between `^` and the backtick — so they cost one
                 // compare each rather than folding into ranges.
                 inline for ([_]u8{ '"', '<', '>', '\\', '^', '`' }) |c| {
-                    bad |= @intFromBool(chunk == @as(Vec, @splat(c)));
+                    bad |= chunk == @as(Vec, @splat(c));
                 }
 
-                // First set bit is the first rejected byte; all-zero means the whole
-                // chunk is target material and `@ctz` returns the vector width.
-                const adv_by = @ctz(@as(VectorInt, @bitCast(bad)));
+                // First rejected lane; an all-accepted chunk is target material all
+                // the way through and yields the vector width.
+                const adv_by = firstRejected(bad);
 
                 cursor.advance(adv_by);
                 if (adv_by != vec_size) {
@@ -551,9 +608,12 @@ const Cursor = struct {
                 // A byte is a valid value char if it's greater than US (31) OR is a TAB,
                 // and isn't DEL (127). TAB is allowed since it's legal inside field values
                 // (RFC 7230 field-content permits SP / HTAB between field-vchars).
-                const bits = (@intFromBool(chunk > full_31) | @intFromBool(chunk == tabs)) & ~@intFromBool(chunk == deletes);
+                //
+                // Stated below as its De Morgan negation, so that `firstRejected`
+                // sees the same reject-mask convention `matchPath` hands it.
+                const bad = ~((chunk > full_31) | (chunk == tabs)) | (chunk == deletes);
 
-                const adv_by = @ctz(~@as(VectorInt, @bitCast(bits)));
+                const adv_by = firstRejected(bad);
 
                 // advance the cursor
                 cursor.advance(adv_by);

@@ -195,6 +195,32 @@ import was cheap, and the reason a corpus from any other parser would be too.
   reason the code looks like this, not a number to re-run. picohttpparser and
   httparse both scan field names byte at a time for the same reason. Reach for
   SIMD here again only with your own benchmark.
+- **Lane masks are extracted two different ways, and the split is load-bearing.**
+  Every vector loop ends by asking "which lane rejected first", and `firstRejected`
+  answers it twice. x86 has `pmovmskb`, so bitcasting the compare result to a
+  bit-per-lane integer is one instruction and already optimal. AArch64 has no such
+  instruction: LLVM lowers `@bitCast(@Vector(N, u1))` into `and`/`ext`/`zip1`/`addv`
+  plus a cross-domain `fmov` — a horizontal reduction sitting inside a
+  loop-carried dependency chain, because the reduction's result *is* the next
+  chunk's address. `matchHeaderValue` got a second one on top (`uminv`+`fmov`,
+  purely to evaluate `adv_by != vec_size`), which is how a 16-byte NEON step ended
+  up costing more than picohttpparser's 8x-unrolled scalar byte loop, whose loads
+  are all independent and therefore throughput-bound rather than latency-bound.
+  `shrn`, narrowing each pair of 16-bit lanes down four bits, leaves one nibble per
+  input byte in a single 64-bit register instead. On the `bench/` request, M3 Max,
+  five interleaved runs comparing minima: 162-168 -> 130-133 ns/parse. Reproducible
+  from the tree by rebuilding at the parent commit. Do not collapse the branches —
+  the nibble form on x86 costs a `psrlw` and a `pshufb` on top of the `pmovmskb` it
+  cannot avoid.
+- **This was invisible for as long as it was because nothing benchmarks the scalar
+  tier.** `-Duse-vectors=false` was 19% *faster* than the shipped build on aarch64,
+  and the option is described above as existing only so the fuzz differential can
+  reach an otherwise-unreachable tier. `bench/build.zig` does not forward it to the
+  `hparse` dependency, so no `zig build bench` run has ever compared the two tiers
+  the parser actually chooses between. A vectorized scan is a hypothesis about the
+  target, not a win; on aarch64 `matchPath` still loses to its own scalar tier on a
+  long request-target (176-177 vs 168-171 ns/parse on a 127-byte path) even with
+  the mask fixed, because pchar takes eight compares per chunk to classify.
 - **The path-differential oracle no longer covers header keys.** It diffs a
   vectors-on build against a vectors-off one, and `matchHeaderKey` is now the
   same code in both. That is worth knowing precisely because both bugs this
