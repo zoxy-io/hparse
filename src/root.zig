@@ -21,9 +21,13 @@ const block_size = @sizeOf(usize);
 // Nothing outside a test should: the detection below is what makes this parser
 // fast on the machine it was built for. The overrides exist because
 // `std.simd.suggestVectorLength` is non-null on every target hparse builds for,
-// so the SWAR/scalar tier below each `use_vectors` branch is otherwise
-// unreachable — and the fuzz harness diffs a forced-scalar build against this
-// one to keep the tiers from disagreeing about the same bytes.
+// so the scalar tier below each `use_vectors` branch is otherwise unreachable —
+// and the fuzz harness diffs a forced-scalar build against this one to keep the
+// tiers from disagreeing about the same bytes.
+//
+// There are two tiers now, not three. The SWAR loops that used to sit between
+// them are gone: see `matchHeaderValue` for the measurement that removed the
+// last one.
 
 // If suggested vector length is null, prefer not to use vectors!
 const use_vectors = build_options.use_vectors orelse (std.simd.suggestVectorLength(u8) != null);
@@ -33,8 +37,8 @@ const use_vectors = build_options.use_vectors orelse (std.simd.suggestVectorLeng
 ///
 /// A forced `-Dvec-size` is ignored when vectors are off, rather than recorded and
 /// unused: every reader of this sits inside `if (comptime use_vectors)`, so the build
-/// would run the SWAR loops at `block_size` while `vector_size` advertised the width
-/// of a tier it does not contain.
+/// would scan byte-at-a-time while `vec_size` advertised the width of a tier it does
+/// not contain.
 const vec_size = if (!use_vectors) block_size else build_options.vec_size orelse blk: {
     if (std.simd.suggestVectorLength(u8)) |recommended| {
         // In the future, we can look for ways to utilize 512-bit (AVX-512) or even larger registers.
@@ -517,7 +521,22 @@ const Cursor = struct {
         }
     }
 
-    /// Validates header values.
+    /// Validates header values: a vector tier and a byte-at-a-time tail, nothing
+    /// in between.
+    ///
+    /// There used to be a SWAR tier here, and deleting it was faster in both builds
+    /// — 0.99x with vectors on, and 0.70x with `-Duse-vectors=false`, where it was
+    /// doing all of the work. Two reasons it never paid. With vectors on it only
+    /// ever saw the 8-to-31-byte window at the very end of the buffer, a couple of
+    /// dozen bytes per parse. And it could not express "TAB is legal" in the
+    /// arithmetic — a borrow from a genuine sub-0x20 byte perturbs the next byte's
+    /// high bit — so it restarted the loop on every TAB, while a table lookup just
+    /// says yes. Header values are overwhelmingly valid, so the branch predictor
+    /// gets the scalar loop right every time.
+    ///
+    /// Which leaves 30 lines of bit arithmetic with a documented borrow hazard,
+    /// bought nothing, and had its own tier to diverge in. If you reinstate it,
+    /// bring numbers for both builds.
     inline fn matchHeaderValue(cursor: *Cursor) void {
         // Unlike headers keys, prefer vectors initially when validating header values if possible.
         if (comptime use_vectors) {
@@ -545,39 +564,6 @@ const Cursor = struct {
                 if (adv_by != vec_size) {
                     return;
                 }
-            }
-        }
-
-        // SWAR search
-        while (cursor.hasLength(block_size)) {
-            const spaces = comptime broadcast(usize, ' ');
-            const ones = comptime broadcast(usize, 0x01);
-            const dels = comptime broadcast(usize, 0x7f);
-            const full_128 = comptime broadcast(usize, 128);
-
-            const chunk = cursor.asInteger(usize);
-
-            const lt = (chunk -% spaces) & ~chunk;
-
-            const xor_dels = chunk ^ dels;
-            const eq_del = (xor_dels -% ones) & ~xor_dels;
-
-            const adv_by = @ctz((lt | eq_del) & full_128) >> 3;
-
-            cursor.advance(adv_by);
-
-            // chunk includes a control char, CRLF or DEL, we've stopped on it.
-            if (adv_by != block_size) {
-                // TAB (9) is a legal value char. We can't mask it out of the less-than
-                // detection above — the borrow from a genuine < 32 byte perturbs the next
-                // byte's high bit — so instead we handle it here: skip the TAB and keep
-                // scanning. `@ctz` gives the *first* stop, so we always land on the TAB
-                // itself before any borrow-induced false positive after it.
-                if (cursor.char() == '\t') {
-                    cursor.advance(1);
-                    continue;
-                }
-                return;
             }
         }
 
@@ -1092,6 +1078,13 @@ inline fn isValidValueChar(c: u8) bool {
 }
 
 /// Table of valid status message characters.
+///
+/// RFC 9112 §4 gives `reason-phrase = *( HTAB / SP / VCHAR / obs-text )`, so this is
+/// deliberately one character STRICTER than the grammar: HTAB is listed invalid
+/// below. Nothing is gained by taking a tab in a phrase clients are told to ignore,
+/// and refusing more than the spec requires is the safe direction for a proxy. It is
+/// called out because it is a real deviation, and an undocumented table choice is
+/// how `key_map` and `path_map` both drifted.
 const status_msg_map = createCharMap(.{
     // Invalid characters.
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,  16,
@@ -1103,23 +1096,29 @@ inline fn isValidStatusMsgChar(c: u8) bool {
     return status_msg_map[c] != 0;
 }
 
-/// Returns an integer filled with a given byte.
-inline fn broadcast(comptime T: type, byte: u8) T {
-    comptime {
-        const bits = @ctz(@as(T, 0));
-        const b = @as(T, byte);
-
-        return switch (bits) {
-            8 => b * 0x01,
-            16 => b * 0x01_01,
-            32 => b * 0x01_01_01_01,
-            64 => b * 0x01_01_01_01_01_01_01_01,
-            else => @compileError("unexpected broadcast size"),
-        };
-    }
-}
-
-/// Returns a table of 8-bit characters where zeros are invalid and ones are valid.
+/// Returns a table of 8-bit characters where zeros are invalid and ones are valid,
+/// built from the list of characters that are NOT allowed.
+///
+/// WHEN TO USE THIS, and it is not "never": write the table in the shape the RFC
+/// writes the set.
+///
+/// Two of this parser's tables were denylists and both drifted into accepting bytes
+/// they should not have. `key_map` admitted 144 non-tchar bytes and `path_map`
+/// admitted `"<>\^`{|}` plus all of 0x80-0xff — in each case because the grammar
+/// defines an ALLOWED set (`token` is `1*tchar`, a path segment is `*pchar`) and
+/// someone transcribed it inside out. Anything the author did not think to exclude
+/// became legal, which is a denylist failing open. Those two are now built as
+/// positive tables, next to the grammar they encode.
+///
+/// The two tables still built here are correct, and for a reason that generalises:
+/// their grammars are themselves stated as exclusions. RFC 9110 field-value is
+/// `VCHAR / obs-text` plus SP and HTAB — every byte except controls and DEL — and
+/// RFC 9112 reason-phrase is the same shape. Listing what they exclude *is* the
+/// direct transcription, and inverting them into 200-entry allowlists would be the
+/// error-prone direction.
+///
+/// So: if the RFC says "these are allowed", write an allowlist. If it says
+/// "everything but these", use this. Do not pick based on which is shorter to type.
 inline fn createCharMap(comptime invalids: anytype) [256]u1 {
     comptime {
         var map: [256]u1 = undefined;

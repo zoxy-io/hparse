@@ -33,7 +33,7 @@ because llhttp does framing and hparse does not.
   minutes on any change to the parser — it has found real bugs in about two
   minutes, twice.
 - `zig build test -Duse-vectors=false` — the same unit tests against the
-  SWAR/scalar tier. Nothing else reaches it: `std.simd.suggestVectorLength` is
+  scalar tier. Nothing else reaches it: `std.simd.suggestVectorLength` is
   non-null on every target this builds for (SSE2 on baseline x86_64, NEON on
   aarch64), so before that option existed the scalar half of every
   `if (comptime use_vectors)` was dead code in every test run.
@@ -55,7 +55,7 @@ They are the reason to trust a change here, so know what they cover:
 - **Consumed-length round-trip.** Re-parsing exactly the N bytes a successful
   parse claims to consume must give a byte-identical result, and every strict
   prefix must return `Incomplete` — never a false accept, and never `Invalid`
-  (which would mean the SIMD, SWAR and scalar tiers disagree about the same
+  (which would mean the SIMD and scalar tiers disagree about the same
   bytes).
 - **Resume equivalence, both directions.** Growing prefixes through
   `parseRequestResume`/`parseResponseResume` must reach the identical answer as

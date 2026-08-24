@@ -15,7 +15,7 @@
 //! 2. Prefix/consumed-length exactness: a successful parse consuming N bytes must
 //!    reproduce byte-identical results when re-parsing exactly those N bytes, and every
 //!    strict prefix of them must return `error.Incomplete` — never a false accept, and
-//!    never `error.Invalid` (which would mean the SIMD/SWAR/scalar matcher tiers, selected
+//!    never `error.Invalid` (which would mean the SIMD and scalar matcher tiers, selected
 //!    by remaining buffer length, disagree about the same bytes).
 //! 3. Path differential: a second build of the parser with the `@Vector` tier forced
 //!    off (`-Duse-vectors=false`) parses the same bytes, and must accept or refuse
@@ -199,7 +199,7 @@ fn expectResumeRejects(g: []const u8) !void {
 /// function — both lived exactly there. Nothing in this harness now watches header
 /// keys for a tier split, because there are no longer two tiers to split.
 ///
-/// The scalar build parses the guarded copy too, so its SWAR loops and scalar tails
+/// The scalar build parses the guarded copy too, so its scalar loops
 /// get the memory-safety oracle rather than only the vector ones.
 ///
 /// A build that itself forced vectors off makes this a self-comparison. That is the
@@ -835,7 +835,7 @@ fn checkRequest(input: []const u8) !void {
 
     // No false accept on truncation: every strict prefix of the consumed bytes must be
     // `error.Incomplete`. `error.Invalid` here means the matcher tier picked for the
-    // shorter tail (SIMD vs SWAR vs scalar) judged the same bytes differently.
+    // shorter tail (SIMD vs scalar) judged the same bytes differently.
     for (0..n) |k| {
         const gk = probe.copy(input[0..k]);
         var mk: hparse.Method = .unknown;
