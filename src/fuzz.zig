@@ -21,9 +21,12 @@
 //!    off (`-Duse-vectors=false`) parses the same bytes, and must accept or refuse
 //!    identically — the tiers disagreeing is what oracle 2 can only catch when the
 //!    disagreement happens to fall across a truncation boundary.
-//! 4. Reference differential against picohttpparser: where BOTH parsers accept, the
-//!    fields must match. Only where both accept — the two disagree about what is
-//!    legal by design, and those disagreements are triage material, not failures.
+//! 4. Reference differential against picohttpparser and llhttp: where hparse and a
+//!    reference BOTH accept, the fields must match. Only where both accept — they
+//!    disagree about what is legal by design, and those disagreements are triage
+//!    material, not failures. Two references rather than one because they are wrong
+//!    differently: picohttpparser is hand-written and block-oriented, llhttp is a
+//!    generated state machine walking one byte at a time.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,9 +34,14 @@ const hparse = @import("hparse");
 /// The same parser built with the @Vector tier forced off; see `diffRequestTiers`.
 const scalar = @import("hparse_scalar");
 
-/// The reference parser; see `diffRequestAgainstReference`.
+/// First reference parser; see `diffRequestAgainstPico`.
 const pico = @cImport({
     @cInclude("picohttpparser.h");
+});
+
+/// Second reference parser; see `diffRequestAgainstLlhttp`.
+const llhttp = @cImport({
+    @cInclude("llhttp.h");
 });
 
 /// Fuzz inputs are capped at one page so a copy always fits in front of the guard page.
@@ -292,7 +300,7 @@ fn diffResponseTiers(
 /// Both parsers read the guarded copy. picohttpparser only ever loads 16-byte blocks
 /// that lie entirely within the buffer, so it is safe to point at the guard page; a
 /// fault inside its frames would be a finding about it, not about hparse.
-fn diffRequestAgainstReference(
+fn diffRequestAgainstPico(
     g: []const u8,
     hparse_result: hparse.ParseRequestError!usize,
     hparse_method: ?[]const u8,
@@ -338,11 +346,11 @@ fn diffRequestAgainstReference(
     try std.testing.expectEqualStrings(hparse_path.?, path[0..path_len]);
     try std.testing.expectEqualStrings(@tagName(hparse_version), try referenceVersion(minor_version));
     try std.testing.expectEqual(hparse_count, count);
-    try expectHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
+    try expectPicoHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
 }
 
-/// `diffRequestAgainstReference` for the response side.
-fn diffResponseAgainstReference(
+/// `diffRequestAgainstPico` for the response side.
+fn diffResponseAgainstPico(
     g: []const u8,
     hparse_result: hparse.ParseRequestError!usize,
     hparse_version: hparse.Version,
@@ -385,7 +393,7 @@ fn diffResponseAgainstReference(
         if (msg_len == 0) "" else msg[0..msg_len],
     );
     try std.testing.expectEqual(hparse_count, count);
-    try expectHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
+    try expectPicoHeadersMatch(hparse_headers[0..hparse_count], headers[0..count]);
 }
 
 /// picohttpparser reports the minor version as a digit and takes any of them;
@@ -404,7 +412,7 @@ fn referenceVersion(minor_version: c_int) ![]const u8 {
 /// Both parsers strip OWS from each end of a value, so the slices are directly
 /// comparable — no normalization, which would be the place to accidentally define
 /// away a real difference.
-fn expectHeadersMatch(ours: []const hparse.Header, theirs: []const pico.phr_header) !void {
+fn expectPicoHeadersMatch(ours: []const hparse.Header, theirs: []const pico.phr_header) !void {
     @disableInstrumentation();
     for (ours, theirs) |a, b| {
         // A null name is picohttpparser reporting an obs-fold continuation line, which
@@ -414,6 +422,253 @@ fn expectHeadersMatch(ours: []const hparse.Header, theirs: []const pico.phr_head
         try std.testing.expectEqualStrings(a.key, b.name[0..b.name_len]);
         try std.testing.expectEqualStrings(a.value, if (b.value_len == 0) "" else b.value[0..b.value_len]);
     }
+}
+
+/// One field as llhttp reports it: a run of bytes inside the input buffer.
+///
+/// llhttp hands a field over through callbacks rather than as a slice, and is free
+/// to split one field across several of them, so a span is assembled here. Feeding
+/// the whole message to a single `llhttp_execute` makes every span contiguous in
+/// practice; `fragmented` records the case where it is not, rather than silently
+/// splicing two disjoint ranges into one slice and comparing whatever lies between
+/// them.
+const Span = struct {
+    ptr: ?[*]const u8 = null,
+    len: usize = 0,
+    fragmented: bool = false,
+
+    fn append(span: *Span, at: [*]const u8, len: usize) void {
+        @disableInstrumentation();
+        const start = span.ptr orelse {
+            span.ptr = at;
+            span.len = len;
+            return;
+        };
+        if (start + span.len != at) {
+            span.fragmented = true;
+            return;
+        }
+        span.len += len;
+    }
+
+    /// A field llhttp never reported and one it reported as empty both read as no
+    /// bytes. The two are distinguishable (`ptr == null`) but nothing here needs to:
+    /// hparse's own absent/empty split does not line up with llhttp's either, and the
+    /// comparisons below are all against `hparse_x orelse ""`.
+    fn bytes(span: Span) []const u8 {
+        @disableInstrumentation();
+        return if (span.ptr) |p| p[0..span.len] else "";
+    }
+};
+
+/// Everything llhttp's callbacks record for one message.
+const LlhttpRecord = struct {
+    method: Span = .{},
+    url: Span = .{},
+    status: Span = .{},
+    keys: [max_headers]Span = [_]Span{.{}} ** max_headers,
+    values: [max_headers]Span = [_]Span{.{}} ** max_headers,
+    /// Counts every header llhttp reports, including any past `max_headers`, so a
+    /// count that overruns the array shows up as a mismatch instead of being
+    /// truncated into agreement.
+    header_count: usize = 0,
+    /// The header line currently being reported, committed on value-complete.
+    pending_key: Span = .{},
+    pending_value: Span = .{},
+    /// Copied off the parser once it accepts; llhttp keeps these as struct fields
+    /// rather than reporting them through a callback.
+    major: u8 = 0,
+    minor: u8 = 0,
+    status_code: u16 = 0,
+};
+
+fn llhttpRecord(parser: [*c]llhttp.llhttp_t) *LlhttpRecord {
+    @disableInstrumentation();
+    return @ptrCast(@alignCast(parser.*.data.?));
+}
+
+fn onLlhttpMethod(parser: [*c]llhttp.llhttp_t, at: [*c]const u8, len: usize) callconv(.c) c_int {
+    @disableInstrumentation();
+    llhttpRecord(parser).method.append(@ptrCast(at), len);
+    return 0;
+}
+
+fn onLlhttpUrl(parser: [*c]llhttp.llhttp_t, at: [*c]const u8, len: usize) callconv(.c) c_int {
+    @disableInstrumentation();
+    llhttpRecord(parser).url.append(@ptrCast(at), len);
+    return 0;
+}
+
+fn onLlhttpStatus(parser: [*c]llhttp.llhttp_t, at: [*c]const u8, len: usize) callconv(.c) c_int {
+    @disableInstrumentation();
+    llhttpRecord(parser).status.append(@ptrCast(at), len);
+    return 0;
+}
+
+fn onLlhttpHeaderField(parser: [*c]llhttp.llhttp_t, at: [*c]const u8, len: usize) callconv(.c) c_int {
+    @disableInstrumentation();
+    llhttpRecord(parser).pending_key.append(@ptrCast(at), len);
+    return 0;
+}
+
+fn onLlhttpHeaderValue(parser: [*c]llhttp.llhttp_t, at: [*c]const u8, len: usize) callconv(.c) c_int {
+    @disableInstrumentation();
+    llhttpRecord(parser).pending_value.append(@ptrCast(at), len);
+    return 0;
+}
+
+fn onLlhttpHeaderValueComplete(parser: [*c]llhttp.llhttp_t) callconv(.c) c_int {
+    @disableInstrumentation();
+    const record = llhttpRecord(parser);
+    if (record.header_count < max_headers) {
+        record.keys[record.header_count] = record.pending_key;
+        record.values[record.header_count] = record.pending_value;
+    }
+    record.header_count += 1;
+    record.pending_key = .{};
+    record.pending_value = .{};
+    return 0;
+}
+
+fn onLlhttpHeadersComplete(_: [*c]llhttp.llhttp_t) callconv(.c) c_int {
+    @disableInstrumentation();
+    // Stop exactly at the end of the head. `llhttp_get_error_pos` then points at the
+    // byte after the final CRLF, which is the consumed length hparse returns — and
+    // without pausing llhttp would run on into the body, where there is nothing to
+    // compare against a parser that does not do framing.
+    return llhttp.HPE_PAUSED;
+}
+
+/// Runs llhttp over `g` as `kind` (`HTTP_REQUEST` or `HTTP_RESPONSE`), returning the
+/// consumed length if it accepted a complete head, or null otherwise.
+///
+/// Null covers both of llhttp's ways of not accepting: a hard error, and `HPE_OK`,
+/// which for a streaming parser means "no error yet, send more". Only our own
+/// `on_headers_complete` pauses, so `HPE_PAUSED` is unambiguous.
+fn runLlhttp(g: []const u8, kind: c_int, record: *LlhttpRecord) ?usize {
+    @disableInstrumentation();
+    var settings: llhttp.llhttp_settings_t = undefined;
+    llhttp.llhttp_settings_init(&settings);
+    settings.on_method = onLlhttpMethod;
+    settings.on_url = onLlhttpUrl;
+    settings.on_status = onLlhttpStatus;
+    settings.on_header_field = onLlhttpHeaderField;
+    settings.on_header_value = onLlhttpHeaderValue;
+    settings.on_header_value_complete = onLlhttpHeaderValueComplete;
+    settings.on_headers_complete = onLlhttpHeadersComplete;
+
+    var parser: llhttp.llhttp_t = undefined;
+    // `HTTP_REQUEST`/`HTTP_RESPONSE` translate as `c_int` while `llhttp_init` takes the
+    // enum's unsigned underlying type; the cast is that mismatch and nothing more.
+    llhttp.llhttp_init(&parser, @intCast(kind), &settings);
+    parser.data = record;
+
+    if (llhttp.llhttp_execute(&parser, @ptrCast(g.ptr), g.len) != llhttp.HPE_PAUSED) return null;
+    record.major = parser.http_major;
+    record.minor = parser.http_minor;
+    record.status_code = parser.status_code;
+    return @intFromPtr(llhttp.llhttp_get_error_pos(&parser)) - @intFromPtr(g.ptr);
+}
+
+/// llhttp reports the version as two integers and accepts more than the two hparse
+/// has names for. Same reasoning as `referenceVersion`: reaching either failure means
+/// hparse accepted a version it cannot represent.
+fn llhttpVersion(major: u8, minor: u8) ![]const u8 {
+    @disableInstrumentation();
+    if (major != 1) return error.ReferenceMajorVersionOutOfRange;
+    return referenceVersion(minor);
+}
+
+/// llhttp's header-value span starts after the leading OWS but runs all the way to
+/// the CR, so it keeps trailing OWS that hparse and picohttpparser both strip.
+/// Trimming it here is a representation difference, not a normalization — it cannot
+/// hide a disagreement about non-OWS bytes.
+fn expectLlhttpHeadersMatch(ours: []const hparse.Header, theirs: *const LlhttpRecord) !void {
+    @disableInstrumentation();
+    for (ours, theirs.keys[0..ours.len], theirs.values[0..ours.len]) |a, key, value| {
+        if (key.fragmented or value.fragmented) return error.ReferenceSpanFragmented;
+        try std.testing.expectEqualStrings(a.key, key.bytes());
+        try std.testing.expectEqualStrings(a.value, std.mem.trimEnd(u8, value.bytes(), " \t"));
+    }
+}
+
+/// Where llhttp and hparse BOTH accept, every field must agree — the same contract as
+/// `diffRequestAgainstPico`, against a reference built the other way round.
+///
+/// Only where both accept, and llhttp refuses considerably more than picohttpparser
+/// does: it rejects any method outside its own table (so every extension method hparse
+/// takes is a verdict difference), rejects obs-fold, and rejects a bare LF. It is also
+/// a streaming parser, so "not accepted" includes `HPE_OK` — see `runLlhttp`.
+///
+/// llhttp reads the guarded copy too. It is a state machine over `data..data+len` and
+/// never looks ahead, so pointing it at the guard page is safe; a fault inside its
+/// frames would be a finding about llhttp, not about hparse.
+fn diffRequestAgainstLlhttp(
+    g: []const u8,
+    hparse_result: hparse.ParseRequestError!usize,
+    hparse_method: ?[]const u8,
+    hparse_path: ?[]const u8,
+    hparse_version: hparse.Version,
+    hparse_headers: *const [max_headers]hparse.Header,
+    hparse_count: usize,
+) !void {
+    @disableInstrumentation();
+
+    var record: LlhttpRecord = .{};
+    const reference_consumed = runLlhttp(g, llhttp.HTTP_REQUEST, &record);
+
+    const consumed = hparse_result catch return;
+    const reference_n = reference_consumed orelse return;
+
+    try std.testing.expectEqual(consumed, reference_n);
+    try std.testing.expect(hparse_method != null);
+    try std.testing.expect(hparse_path != null);
+    if (record.method.fragmented or record.url.fragmented) return error.ReferenceSpanFragmented;
+    try std.testing.expectEqualStrings(hparse_method.?, record.method.bytes());
+    try std.testing.expectEqualStrings(hparse_path.?, record.url.bytes());
+    try std.testing.expectEqualStrings(
+        @tagName(hparse_version),
+        try llhttpVersion(record.major, record.minor),
+    );
+    try std.testing.expectEqual(hparse_count, record.header_count);
+    try expectLlhttpHeadersMatch(hparse_headers[0..hparse_count], &record);
+}
+
+/// `diffRequestAgainstLlhttp` for the response side.
+fn diffResponseAgainstLlhttp(
+    g: []const u8,
+    hparse_result: hparse.ParseRequestError!usize,
+    hparse_version: hparse.Version,
+    hparse_status: u16,
+    hparse_msg: ?[]const u8,
+    hparse_headers: *const [max_headers]hparse.Header,
+    hparse_count: usize,
+) !void {
+    @disableInstrumentation();
+
+    var record: LlhttpRecord = .{};
+    const reference_consumed = runLlhttp(g, llhttp.HTTP_RESPONSE, &record);
+
+    const consumed = hparse_result catch return;
+    const reference_n = reference_consumed orelse return;
+
+    try std.testing.expectEqual(consumed, reference_n);
+    try std.testing.expectEqual(hparse_status, record.status_code);
+    try std.testing.expectEqualStrings(
+        @tagName(hparse_version),
+        try llhttpVersion(record.major, record.minor),
+    );
+    if (record.status.fragmented) return error.ReferenceSpanFragmented;
+    // llhttp consumes exactly one space after the status code and keeps any others;
+    // hparse and picohttpparser both skip the whole run. As with the header-value
+    // trim, this is a representation difference and not a normalization: only spaces
+    // hparse is documented to skip are dropped here.
+    try std.testing.expectEqualStrings(
+        hparse_msg orelse "",
+        std.mem.trimStart(u8, record.status.bytes(), " "),
+    );
+    try std.testing.expectEqual(hparse_count, record.header_count);
+    try expectLlhttpHeadersMatch(hparse_headers[0..hparse_count], &record);
 }
 
 fn checkRequest(input: []const u8) !void {
@@ -431,7 +686,8 @@ fn checkRequest(input: []const u8) !void {
     const one_shot = hparse.parseRequest(g, &method, &method_token, &path, &version, &headers, &count);
 
     try diffRequestTiers(g, one_shot, method, method_token, path, version, &headers, count);
-    try diffRequestAgainstReference(g, one_shot, method_token, path, version, &headers, count);
+    try diffRequestAgainstPico(g, one_shot, method_token, path, version, &headers, count);
+    try diffRequestAgainstLlhttp(g, one_shot, method_token, path, version, &headers, count);
 
     if (one_shot == error.Invalid or one_shot == error.TooManyHeaders) {
         // The direction that matters most for a proxy and was previously
@@ -589,7 +845,8 @@ fn checkResponse(input: []const u8) !void {
     // Memory-safety oracle: any overread during this call faults on the guard page.
     const one_shot = hparse.parseResponse(g, &version, &status_code, &status_msg, &headers, &count);
     try diffResponseTiers(g, one_shot, version, status_code, status_msg, &headers, count);
-    try diffResponseAgainstReference(g, one_shot, version, status_code, status_msg, &headers, count);
+    try diffResponseAgainstPico(g, one_shot, version, status_code, status_msg, &headers, count);
+    try diffResponseAgainstLlhttp(g, one_shot, version, status_code, status_msg, &headers, count);
     const n = one_shot catch return;
 
     // Cheap invariants on every successful parse.
@@ -752,6 +1009,10 @@ const response_corpus = [_][]const u8{
     seed("HTTP/1.1 418 I'm a teapot\r\nHost: localhost\r\nSome-Number-Sequence: 123291429\r\n\r\n"),
     seed("HTTP/1.0 204\r\n\r\n"), // no status message
     seed("HTTP/1.1 301   Moved Permanently\n\n"), // multiple spaces + bare LF (must reject)
+    // The same multiple spaces, accepted. llhttp consumes exactly one of them and
+    // keeps the rest in its status span where hparse skips the whole run, so this is
+    // the only corpus entry that reaches the trim in `diffResponseAgainstLlhttp`.
+    seed("HTTP/1.1 301   Moved Permanently\r\nLocation: /x  \t\r\n\r\n"),
     seed("HTTP/1.1 200 OK\r\nHost: x"), // truncated header value
 };
 

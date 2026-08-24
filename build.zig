@@ -199,6 +199,32 @@ pub fn build(b: *std.Build) void {
     fuzz_mod.addIncludePath(b.path("bench/picohttpparser"));
     fuzz_mod.linkLibrary(pico_lib);
 
+    // llhttp, as the second reference parser. Vendored for the benchmarks like
+    // picohttpparser, and compiled as its own uninstrumented library for the same
+    // reason (see above).
+    //
+    // A second reference earns its place by being wrong differently: llhttp is a
+    // generated state machine walking one byte at a time, picohttpparser is
+    // hand-written and block-oriented, so a bug they would both wave through is
+    // unlikely to be the same bug.
+    const llhttp_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    llhttp_mod.addCSourceFiles(.{
+        .root = b.path("bench/llhttp"),
+        .files = &.{ "api.c", "http.c", "llhttp.c" },
+        .flags = &.{"-O2"},
+    });
+    const llhttp_lib = b.addLibrary(.{
+        .name = "llhttp",
+        .root_module = llhttp_mod,
+    });
+
+    fuzz_mod.addIncludePath(b.path("bench/llhttp"));
+    fuzz_mod.linkLibrary(llhttp_lib);
+
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,
         // Patched copy of the default test runner; the stock one fails to compile in

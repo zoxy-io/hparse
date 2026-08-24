@@ -53,10 +53,12 @@ zig build fuzz          # replay the seed corpus through the oracles (fast regre
 zig build fuzz --fuzz   # coverage-guided fuzzing with a live web UI
 ```
 
-Plain bounds checking can't catch this parser's most likely bug class — it walks the buffer with `[*]` many-item pointers, so a 1-byte overread doesn't fault, it silently reads adjacent memory. The harness makes that class visible with two oracles:
+Plain bounds checking can't catch this parser's most likely bug class — it walks the buffer with `[*]` many-item pointers, so a 1-byte overread doesn't fault, it silently reads adjacent memory. The first oracle below makes that class visible; the other three cover what self-consistency alone can't reach:
 
 * **Guard pages** — every parse runs on a copy whose last byte abuts a `PROT_NONE` page, so any overread is an instant segfault.
 * **Prefix exactness** — a parse that consumed N bytes must reproduce byte-identical results from exactly those N bytes, and every strict prefix must return `error.Incomplete`. Since shorter tails select different matcher tiers (SIMD → SWAR → scalar), this also flags tier divergence whenever a scalar tier rejects bytes the vector tier accepted.
+* **Path differential** — a second build of the parser with `-Duse-vectors=false` parses the same bytes and must reach the same verdict, including *which* error.
+* **Reference differential** — [picohttpparser](https://github.com/h2o/picohttpparser) and [llhttp](https://github.com/nodejs/llhttp) parse the same bytes. Wherever hparse and a reference *both* accept, every field must match: consumed length, method, target, version, each header key and value, and the status code and message. Only where both accept — the three disagree about what is legal by design. Two references because they're wrong differently: picohttpparser is hand-written and block-oriented, llhttp is a generated state machine walking one byte at a time.
 
 `zig build test` also replays the fuzz corpus, so CI exercises the oracles on every run.
 
@@ -117,6 +119,7 @@ const exe = b.addExecutable(.{
 This project wouldn't be possible without these other projects and posts:
 
 * [h2o/picohttpparser](https://github.com/h2o/picohttpparser)
+* [nodejs/llhttp](https://github.com/nodejs/llhttp)
 * [seanmonstar/httparse](https://github.com/seanmonstar/httparse)
 * [SIMD with Zig by Karl Seguin](https://www.openmymind.net/SIMD-With-Zig/)
 * [SWAR explained: parsing eight digits by Daniel Lemire](https://lemire.me/blog/2022/01/21/swar-explained-parsing-eight-digits/)

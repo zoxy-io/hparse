@@ -51,16 +51,29 @@ They are the reason to trust a change here, so know what they cover:
   `parseRequestResume`/`parseResponseResume` must reach the identical answer as
   one shot, AND must never accept a message the one-shot path refuses. The
   second half is the one that matters for a proxy and it is easy to leave out.
-- **Reference differential.** Where hparse and picohttpparser BOTH accept, every
-  field must match: consumed length, method, target, version, each header key
-  and value, and on the response side the status code and status message. Only where both accept — they disagree about what is legal by
-  design (picohttpparser takes a bare LF, an obs-fold line, a leading empty line
-  and any HTTP minor digit), and those verdict differences are triage material,
-  not failures. What it catches is the case self-consistency cannot: both
-  parsers agreeing a message is well-formed and then disagreeing about what it
-  says. The reference is the copy already vendored for the benchmarks, so there
-  is one picohttpparser in the repo, not two, and `bench/` is outside the
-  published package — the fuzz step only ever builds in-tree.
+- **Reference differential**, against **picohttpparser and llhttp**. Where hparse
+  and a reference BOTH accept, every field must match: consumed length, method,
+  target, version, each header key and value, and on the response side the status
+  code and status message. Only where both accept — they disagree about what is
+  legal by design, and those verdict differences are triage material, not
+  failures. picohttpparser takes a bare LF, an obs-fold line, a leading empty line
+  and any HTTP minor digit; llhttp refuses all of those but also refuses any
+  method outside its own table, so every extension method hparse takes is a
+  verdict difference too. What this catches is the case self-consistency cannot:
+  both parsers agreeing a message is well-formed and then disagreeing about what
+  it says. Two references because they are wrong differently — picohttpparser is
+  hand-written and block-oriented, llhttp is a generated state machine walking one
+  byte at a time — so a bug they would both wave through is unlikely to be the
+  same bug. Both are the copies already vendored for the benchmarks, so there is
+  one of each in the repo, not two, and `bench/` is outside the published package
+  — the fuzz step only ever builds in-tree.
+
+  Two things are normalized before comparing against llhttp, and only two:
+  it keeps the trailing OWS on a header value, and it consumes exactly one space
+  after the status code where hparse skips the whole run. Both are representation
+  differences that cannot hide a disagreement about non-space bytes. Every other
+  field is compared raw — normalization is where a real difference gets defined
+  away, so anything added there needs the same argument.
 - **Path differential.** A second build of the parser with the `@Vector` tier
   forced off parses the same bytes and must reach the same verdict — including
   *which* error. The tier is chosen by how many bytes remain, so the two builds
