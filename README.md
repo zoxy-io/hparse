@@ -21,31 +21,48 @@ Benchmarks live under [`bench/`](https://github.com/zoxy-io/hparse/tree/main/ben
 
 ```sh
 cd bench
-zig build bench                # 1M parses per run, 5 runs per parser
-zig build bench -Druns=10      # more repetitions
-zig build bench -Diters=10000000  # heavier workload per run
+zig build bench                     # the `chrome` request, 1M parses per run, 5 runs per parser
+zig build bench -Druns=10           # more repetitions
+zig build bench -Diters=10000000    # heavier workload per run
+zig build bench -Dworkload=all      # every request shape (see below)
+zig build bench -Duse-vectors=false # the scalar tier instead of @Vector
 ```
 
-This builds and compares four parsers on the same request workload: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`), **picohttpparser** and **llhttp** (both compiled from C by Zig's bundled clang).
+This builds and compares four parsers on the same request: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`), **picohttpparser** and **llhttp** (both compiled from C by Zig's bundled clang). Timing happens inside each benchmark binary and is reported as ns/parse, so process startup is not folded into the number.
 
 Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run, 10 runs per parser:
 
 ```
+chrome — everything at once; the historical baseline, 430 bytes
 name                    min       mean        max      rel
 ----------------------------------------------------------
-hparse               0.067s     0.072s     0.082s    1.00x
-picohttpparser       0.118s     0.125s     0.139s    1.76x
-llhttp               0.235s     0.242s     0.260s    3.51x
-std.http             0.709s     0.733s     0.764s   10.59x
+hparse              68.9 ns    76.9 ns    80.6 ns    1.00x
+picohttpparser     113.3 ns   121.9 ns   125.7 ns    1.64x
+llhttp             226.1 ns   238.9 ns   243.5 ns    3.28x
+std.http           602.7 ns   606.7 ns   618.5 ns    8.75x
 ```
 
-Compare bands across runs, never single numbers: an interleaved repeat of the run
-above put hparse at 0.064-0.080s and left the other three where they are.
+Compare bands across runs, never single numbers.
 
-For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
+### One request is not enough
+
+`chrome` is a realistic browser request, and for years it was the only thing measured here. It parses a request line, nine header keys totalling ~93 bytes and nine values totalling ~350, so any change confined to one scan moves it by a few percent — inside the run-to-run band. `-Dworkload=all` runs shapes chosen to make one scan dominate, which is what makes a single-digit change visible:
+
+| workload | loads | hparse | picohttpparser |
+|---|---|---|---|
+| `chrome` | everything at once | **68.1 ns** | 116.7 ns |
+| `long-path` | `matchPath`, 127-byte target | **9.4 ns** | 26.4 ns |
+| `long-keys` | `matchHeaderKey`, 8 × 41-byte names | 166.8 ns | **96.6 ns** |
+| `long-values` | `matchHeaderValue`, 4 × 390-byte values | **52.2 ns** | 237.7 ns |
+| `many-tiny` | per-header overhead, 24 headers | **134.1 ns** | 279.4 ns |
+| `minimal` | fixed per-parse cost | **4.9 ns** | 17.1 ns |
+
+They are not realistic traffic and are not meant to be — `chrome` is the one that stands in for that. They are instruments. `long-keys` is the shape that matters most: it is the one workload where picohttpparser is faster, because hparse scans field names a byte at a time while picohttpparser vectorizes that scan with SSE4.2 `pcmpestri` over eight ranges and only consults its exact token table at the byte where the scan stopped.
+
+For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`; each takes an optional workload name as its one argument.
 
 > [!IMPORTANT]
-> **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~45x slower (0.065-0.081s vs 3.17-3.21s on the benchmark above, three interleaved runs). The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
+> **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~45x slower (0.065-0.081s vs 3.17-3.21s over 1M parses of `chrome`, three interleaved runs). The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
 
 ## Fuzzing
 

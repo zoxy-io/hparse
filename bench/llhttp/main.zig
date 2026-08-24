@@ -2,7 +2,7 @@
 //! bundled clang, same as picohttpparser); only this driver is Zig.
 
 const std = @import("std");
-const iters = @import("bench_options").iters;
+const workloads = @import("workloads");
 
 // Manually declared to match include/llhttp.h field-for-field, rather than
 // pulling the whole header through @cImport for a struct this small.
@@ -66,20 +66,19 @@ const HTTP_REQUEST: c_int = 1;
 extern fn llhttp_init(parser: *llhttp_t, @"type": c_int, settings: *const llhttp_settings_t) void;
 extern fn llhttp_execute(parser: *llhttp_t, data: [*]const u8, len: usize) c_int;
 
-pub fn main() !void {
-    const buffer: []const u8 = "GET /cookies HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nConnection: keep-alive\r\nCache-Control: max-age=0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nUser-Agent: Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.17 (KHTML, like Gecko) Chrome/24.0.1312.56 Safari/537.17\r\nAccept-Encoding: gzip,deflate,sdch\r\nAccept-Language: en-US,en;q=0.8\r\nAccept-Charset: ISO-8859-1,utf-8;q=0.7,*;q=0.3\r\nCookie: name=wookie\r\n\r\n";
+// No callbacks: no workload carries a body (none of them set Content-Length or
+// Transfer-Encoding), so llhttp reaches message-complete and stops at the end of
+// the buffer without one, matching the "headers only" shape of the other
+// benchmarks.
+const settings: llhttp_settings_t = .{};
 
-    // No callbacks: the buffer carries no body (no Content-Length, no
-    // Transfer-Encoding), so llhttp reaches message-complete and stops at the
-    // end of the buffer without one, matching the "headers only" shape of the
-    // other benchmarks.
-    const settings: llhttp_settings_t = .{};
+pub fn main(init: std.process.Init) !void {
+    try workloads.run(init, parseOne);
+}
 
-    var i: usize = 0;
-    while (i < iters) : (i += 1) {
-        var parser: llhttp_t = undefined;
-        llhttp_init(&parser, HTTP_REQUEST, &settings);
-        const err = llhttp_execute(&parser, buffer.ptr, buffer.len);
-        if (err != 0) return error.ParseFailed;
-    }
+fn parseOne(buffer: []const u8) !void {
+    var parser: llhttp_t = undefined;
+    llhttp_init(&parser, HTTP_REQUEST, &settings);
+    const err = llhttp_execute(&parser, buffer.ptr, buffer.len);
+    if (err != 0) return error.ParseFailed;
 }

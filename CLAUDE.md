@@ -38,7 +38,11 @@ because llhttp does framing and hparse does not.
   aarch64), so before that option existed the scalar half of every
   `if (comptime use_vectors)` was dead code in every test run.
 - `zig build bench` for anything on a scanning path. Compare bands across
-  runs, never single numbers.
+  runs, never single numbers. `-Dworkload=all` runs six request shapes instead of
+  the one browser request that used to be the whole benchmark; use it whenever a
+  change touches a single scan, because `chrome` alone hides a change confined to
+  one of them inside its own band. `-Duse-vectors=false` now reaches the parser
+  from here too, so the two tiers can finally be compared.
 
 Style follows [zoxy's docs/TIGER_STYLE.md](../zoxy/docs/TIGER_STYLE.md), and
 the `tiger-style-reviewer` agent in this repo reviews a diff against it. Run
@@ -191,10 +195,25 @@ import was cheap, and the reason a corpus from any other parser would be too.
   correct. Header keys are short, so a 16-byte-wide setup never amortizes;
   re-measured with 40-byte keys, where SIMD should win if it ever does, and it
   still loses. Those ratios are **not reproducible from the tree** — the variant
-  is deleted and nothing in `bench/` isolates this function — so they are the
-  reason the code looks like this, not a number to re-run. picohttpparser and
-  httparse both scan field names byte at a time for the same reason. Reach for
-  SIMD here again only with your own benchmark.
+  is deleted — so they are the reason the code looks like this, not a number to
+  re-run. `bench/` does now isolate this function: `-Dworkload=long-keys` is
+  8 x 41-byte field names, and it is the **one workload where picohttpparser is
+  faster than hparse** (96.6 ns/parse against 166.8, Core Ultra 7 258V, 5 runs,
+  minima).
+
+  That last sentence used to read "picohttpparser and httparse both scan field
+  names byte at a time for the same reason", and for picohttpparser it was simply
+  wrong. `parse_token` calls `findchar_fast` first — SSE4.2 `pcmpestri` in
+  `_SIDD_CMP_RANGES` mode over eight ranges approximating non-tchar — and only
+  then walks `token_char_map` a byte at a time from wherever the vector scan
+  stopped. Approximate wide, verify narrow. The reason that shape is hard to copy
+  here is specific and worth knowing: one `pcmpestri` tests eight ranges, which is
+  why picohttpparser pays no per-range cost, while the portable `@Vector`
+  formulation needs six subtract-and-compares plus three equalities to say the
+  same thing. So the measurement above stands, the explanation for it does not,
+  and the gap is now visible in the tree instead of being asserted in a comment.
+  Reach for SIMD here again only with your own benchmark — but there is now a
+  workload that would show it working.
 - **The vector loops advance by a constant, and only the chunk that stops a scan
   pays for a position.** This is the single biggest thing in the scanning code.
   Both loops used to end `cursor.advance(firstRejected(bad))` unconditionally, so
@@ -230,14 +249,32 @@ import was cheap, and the reason a corpus from any other parser would be too.
 - **`std.simd.firstTrue` is not the shortcut it looks like.** It does
   `@reduce(.Or, vec)` and then `@select` plus `@reduce(.Min, indices)` — two
   horizontal reductions, which is worse on AArch64 than either form above.
-- **Nothing benchmarks the scalar tier, and that is how this hid.**
+- **The scalar tier is benchmarkable now, and the first run found something.**
   `-Duse-vectors=false` was 19% *faster* than the shipped build on aarch64 before
-  the two fixes above, and the option is described further up as existing only so
-  the fuzz differential can reach an otherwise-unreachable tier. `bench/build.zig`
-  does not forward it to the `hparse` dependency, so no `zig build bench` run has
-  ever compared the two tiers the parser actually chooses between. A vectorized
-  scan is a hypothesis about the target, not a win, and this one was wrong for
-  months.
+  the two loop fixes above, and for months nothing could have shown that:
+  `bench/build.zig` did not forward the option to the `hparse` dependency. It does
+  now. The first comparison it made possible, Core Ultra 7 258V, 3 runs, minima:
+
+  | workload | vectors on | vectors off |
+  |---|---|---|
+  | `chrome` | **68.1 ns** | 137.4 ns |
+  | `long-path` | **9.4 ns** | 43.9 ns |
+  | `long-values` | **52.2 ns** | 432.3 ns |
+  | `long-keys` | 166.8 ns | **116.5 ns** |
+  | `many-tiny` | 134.1 ns | **60.3 ns** |
+
+  The last two rows are the finding: on requests whose header values are a few
+  bytes long, turning the vector tier **off** is up to 2.2x faster. The mechanism
+  is that `matchHeaderValue` gates its vector loop on `hasLength(vec_size)`, which
+  asks how much *buffer* remains, not how long the value is — so a 1-byte value
+  sitting anywhere but the very end of the head still pays a 32-byte load, five
+  vector ops, a `pmovmskb` and a `@ctz` to find a CR one byte away. `chrome` hides
+  it because its two long values (71 and 120 bytes) more than pay for the seven
+  short ones. Real traffic has a lot of short header values, so this is worth
+  fixing rather than filing; the obvious shape is a few scalar iterations before
+  entering the vector loop, which costs long values almost nothing. Not attempted
+  yet — measure it, do not assume it. A vectorized scan is a hypothesis about the
+  target, not a win, and this one is wrong for a whole class of input.
 - **The path-differential oracle no longer covers header keys.** It diffs a
   vectors-on build against a vectors-off one, and `matchHeaderKey` is now the
   same code in both. That is worth knowing precisely because both bugs this

@@ -1,15 +1,15 @@
 const std = @import("std");
+const workloads = @import("workloads");
+
 const Head = std.http.Server.Request.Head;
-const iters = @import("bench_options").iters;
 
-pub fn main() !void {
-    const buffer: []const u8 = "GET /cookies HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nConnection: keep-alive\r\nCache-Control: max-age=0\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nUser-Agent: Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.17 (KHTML, like Gecko) Chrome/24.0.1312.56 Safari/537.17\r\nAccept-Encoding: gzip,deflate,sdch\r\nAccept-Language: en-US,en;q=0.8\r\nAccept-Charset: ISO-8859-1,utf-8;q=0.7,*;q=0.3\r\nCookie: name=wookie\r\n\r\n";
+pub fn main(init: std.process.Init) !void {
+    try workloads.run(init, parseOne);
+}
 
-    var i: usize = 0;
-    while (i < iters) : (i += 1) {
-        const head = try Head.parse(buffer);
-        // Same compilation unit as the parser — consume the result so LLVM can't
-        // elide parts of the parse (see hparse/main.zig).
-        std.mem.doNotOptimizeAway(head);
-    }
+fn parseOne(buffer: []const u8) !void {
+    const head = try Head.parse(buffer);
+    // Same compilation unit as the parser — consume the result so LLVM can't
+    // elide parts of the parse (see hparse/main.zig).
+    std.mem.doNotOptimizeAway(head);
 }

@@ -18,20 +18,58 @@ pub fn build(b: *std.Build) void {
     const optimize: std.builtin.OptimizeMode = .ReleaseFast;
 
     const runs = b.option(usize, "runs", "Repetitions per benchmark (default 5)") orelse 5;
-    const iters = b.option(usize, "iters", "Parse iterations per benchmark run (default 1_000_000)") orelse 1_000_000;
+    const iters = b.option(usize, "iters", "Parse iterations per workload per run (default 1_000_000)") orelse 1_000_000;
 
-    // Compile-time iteration count shared by all three benchmark binaries so the
-    // workload stays identical across parsers. std.http is ~30x slower than the rest,
-    // so keep the default modest and pass e.g. -Diters=10000000 for a heavier run.
+    // Which workload shape to run. Defaults to `chrome` — the single request every
+    // number in this repo was measured on — so `zig build bench` stays the quick,
+    // historically comparable command it has always been. `-Dworkload=all` runs the
+    // whole suite, which is what to use when attributing a change to one scan.
+    const workload = b.option([]const u8, "workload", "Workload to run: a name from bench/workloads.zig, or `all` (default: chrome)") orelse "chrome";
+
+    // The scan tier the parser compiles, forwarded to the hparse dependency.
+    //
+    // These existed in the root build.zig from the start but stopped here, so no
+    // `zig build bench` run had ever compared the two tiers the parser actually
+    // chooses between. That is not hypothetical: on aarch64 the scalar tier was 19%
+    // FASTER than the shipped vector build for months, and nothing in this directory
+    // could have shown it.
+    const use_vectors = b.option(bool, "use-vectors", "Force the @Vector scan tier on or off in hparse (default: detect from the target CPU)");
+    const vec_size = b.option(u16, "vec-size", "Force hparse's vector width in bytes (default: detect from the target CPU)");
+
+    // Compile-time iteration count shared by every benchmark binary so the workload
+    // stays identical across parsers. std.http is ~10x slower than the rest, so keep
+    // the default modest and pass e.g. -Diters=10000000 for a heavier run.
     const bench_options = b.addOptions();
     bench_options.addOption(usize, "iters", iters);
     const options_module = bench_options.createModule();
 
-    // The parser under test, consumed as a normal Zig module from the repo root.
-    const hparse = b.dependency("hparse", .{
+    // The request shapes, shared by every driver. They used to be one buffer
+    // copy-pasted into each of them, which is how four drivers stayed in sync by
+    // luck. This module also owns the in-process timing loop.
+    const workloads_module = b.createModule(.{
+        .root_source_file = b.path("workloads.zig"),
         .target = target,
         .optimize = optimize,
-    }).module("hparse");
+        .imports = &.{.{ .name = "bench_options", .module = options_module }},
+    });
+
+    // The parser under test, consumed as a normal Zig module from the repo root.
+    //
+    // The tier options are only passed when set, because a dependency's option set
+    // is part of its cache key: passing `.@"use-vectors" = null` is not the same as
+    // not passing it, and would recompile hparse under a different key than a plain
+    // `zig build` in the repo root.
+    const hparse_dep = if (use_vectors) |uv|
+        if (vec_size) |vs|
+            b.dependency("hparse", .{ .target = target, .optimize = optimize, .@"use-vectors" = uv, .@"vec-size" = vs })
+        else
+            b.dependency("hparse", .{ .target = target, .optimize = optimize, .@"use-vectors" = uv })
+    else if (vec_size) |vs|
+        b.dependency("hparse", .{ .target = target, .optimize = optimize, .@"vec-size" = vs })
+    else
+        b.dependency("hparse", .{ .target = target, .optimize = optimize });
+
+    const hparse = hparse_dep.module("hparse");
 
     // hparse benchmark (Zig).
     //
@@ -47,7 +85,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "hparse", .module = hparse },
-                .{ .name = "bench_options", .module = options_module },
+                .{ .name = "workloads", .module = workloads_module },
             },
         }),
     });
@@ -60,7 +98,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("headparser/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "bench_options", .module = options_module }},
+            .imports = &.{.{ .name = "workloads", .module = workloads_module }},
         }),
     });
 
@@ -71,7 +109,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "bench_options", .module = options_module }},
+        .imports = &.{.{ .name = "workloads", .module = workloads_module }},
     });
     pico_mod.addCSourceFiles(.{
         .files = &.{"picohttpparser/picohttpparser.c"},
@@ -90,7 +128,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "bench_options", .module = options_module }},
+        .imports = &.{.{ .name = "workloads", .module = workloads_module }},
     });
     llhttp_mod.addIncludePath(b.path("llhttp"));
     llhttp_mod.addCSourceFiles(.{
@@ -116,11 +154,16 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("runner/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            // For the workload table: the runner labels each table with the shape's
+            // description and size, and rejects result lines naming a shape that is
+            // not in it.
+            .imports = &.{.{ .name = "workloads", .module = workloads_module }},
         }),
     });
 
     const run_bench = b.addRunArtifact(runner);
     run_bench.addArgs(&.{ "--runs", b.fmt("{d}", .{runs}) });
+    if (!std.mem.eql(u8, workload, "all")) run_bench.addArgs(&.{ "--workload", workload });
     run_bench.addArg("hparse");
     run_bench.addArtifactArg(hparse_bench);
     run_bench.addArg("std.http");

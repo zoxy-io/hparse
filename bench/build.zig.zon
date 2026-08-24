@@ -11,6 +11,8 @@
         "hparse",
         "headparser",
         "picohttpparser",
+        "llhttp",
         "runner",
+        "workloads.zig",
     },
 }
