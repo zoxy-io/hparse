@@ -39,6 +39,9 @@ const pico = @cImport({
     @cInclude("picohttpparser.h");
 });
 
+/// Seed corpus harvested from llhttp's markdown test fixtures.
+const corpus_llhttp = @import("corpus_llhttp.zig");
+
 /// Second reference parser; see `diffRequestAgainstLlhttp`.
 const llhttp = @cImport({
     @cInclude("llhttp.h");
@@ -1016,10 +1019,27 @@ const response_corpus = [_][]const u8{
     seed("HTTP/1.1 200 OK\r\nHost: x"), // truncated header value
 };
 
+/// Length-prefixes a whole array of raw messages, so `corpus_llhttp.zig` can stay
+/// plain data and the Smith encoding stays a concern of this file alone.
+fn seedAll(comptime inputs: []const []const u8) [inputs.len][]const u8 {
+    comptime {
+        var out: [inputs.len][]const u8 = undefined;
+        for (inputs, 0..) |s, i| out[i] = seed(s);
+        const final = out;
+        return final;
+    }
+}
+
+// The hand-written seeds above pin the shapes this parser's own invariants turn on
+// and are worth reading; llhttp's are breadth, and there are two hundred of them.
+// Keeping them in separate arrays means the curated list stays legible.
+const all_request_corpus = request_corpus ++ seedAll(&corpus_llhttp.requests);
+const all_response_corpus = response_corpus ++ seedAll(&corpus_llhttp.responses);
+
 test "fuzz parseRequest" {
-    return std.testing.fuzz({}, fuzzParseRequest, .{ .corpus = &request_corpus });
+    return std.testing.fuzz({}, fuzzParseRequest, .{ .corpus = &all_request_corpus });
 }
 
 test "fuzz parseResponse" {
-    return std.testing.fuzz({}, fuzzParseResponse, .{ .corpus = &response_corpus });
+    return std.testing.fuzz({}, fuzzParseResponse, .{ .corpus = &all_response_corpus });
 }

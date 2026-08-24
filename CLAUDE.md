@@ -83,6 +83,30 @@ They are the reason to trust a change here, so know what they cover:
   minute of `--fuzz`, and the corpus alone does not — the differential earns
   its keep only under coverage-guided fuzzing.
 
+## Where the seed corpus comes from
+
+Two arrays, kept apart on purpose. The hand-written seeds at the bottom of
+`src/fuzz.zig` pin the shapes this parser's own invariants turn on — the 16-byte
+minimum request, a space in a header key, a registered-method prefix collision —
+and each is worth reading. `src/corpus_llhttp.zig` is breadth: 211 inputs
+harvested from llhttp's markdown fixtures (`test/{request,response}/*.md`, v9.4.3,
+the release already vendored under `bench/`), which is hand-written HTTP edge
+cases nobody here thought to write down.
+
+It is **generated** by `tools/extract_llhttp_corpus.pl`, whose decode replicates
+`test/md-test.ts` step for step. The order of those steps is load-bearing:
+normalizing line endings *before* expanding backslash escapes is what makes a
+blank line a CRLF while leaving an explicit `\n` a bare LF. Doing it the other
+way round would silently turn every bare-LF rejection case into an accepted one,
+and the corpus would still look fine. The file's header records the one
+deliberate deviation and what was dropped.
+
+Only inputs were taken. llhttp pairs each fixture with an expected event trace,
+and none of it transfers — hparse returns a consumed length and slices, not
+`on_url` callbacks. It does not need to: every oracle here is differential or
+self-consistency, so a seed carries its own verdict. That is the reason this
+import was cheap, and the reason a corpus from any other parser would be too.
+
 ## Invariants worth knowing before editing
 
 - **Never allocates, never copies.** Every returned slice points into the

@@ -60,6 +60,8 @@ Plain bounds checking can't catch this parser's most likely bug class — it wal
 * **Path differential** — a second build of the parser with `-Duse-vectors=false` parses the same bytes and must reach the same verdict, including *which* error.
 * **Reference differential** — [picohttpparser](https://github.com/h2o/picohttpparser) and [llhttp](https://github.com/nodejs/llhttp) parse the same bytes. Wherever hparse and a reference *both* accept, every field must match: consumed length, method, target, version, each header key and value, and the status code and message. Only where both accept — the three disagree about what is legal by design. Two references because they're wrong differently: picohttpparser is hand-written and block-oriented, llhttp is a generated state machine walking one byte at a time.
 
+The seed corpus is a small hand-written set covering this parser's own invariants, plus 211 inputs harvested from [llhttp's markdown test fixtures](https://github.com/nodejs/llhttp/tree/v9.4.3/test) into [`src/corpus_llhttp.zig`](src/corpus_llhttp.zig). Only the inputs transfer — the oracles above are differential and self-consistency checks, so a seed needs no expected output to be useful.
+
 `zig build test` also replays the fuzz corpus, so CI exercises the oracles on every run.
 
 ## Usage
