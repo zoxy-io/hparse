@@ -83,6 +83,29 @@ They are the reason to trust a change here, so know what they cover:
   minute of `--fuzz`, and the corpus alone does not — the differential earns
   its keep only under coverage-guided fuzzing.
 
+## The disagreement snapshot
+
+`src/disagreements.zig` lists every corpus input where hparse and a reference reach
+different verdicts, each with a required one-line `why`. `zig build fuzz` recomputes
+the set and fails when it moves — NEW, RESOLVED, CHANGED, ORPHAN, or an entry whose
+`why` is still a placeholder.
+
+It exists because the reference differential compares fields only where both parsers
+*accept*, and skips everything else. The skipped set is where the tchar bug lived for
+eight months: picohttpparser rejected `Fo@:`, hparse accepted it, and the oracle
+dropped the disagreement silently. llhttp's own fixture for that exact input was in
+the corpus and ran clean. Verified: reintroduce the bug and this test names the input
+and warns that hparse is the only parser accepting it.
+
+That signature — `hparse = true` with **both** references false — is the one to fear,
+and there are currently zero such entries. One reference disagreeing is usually a
+layering difference (llhttp does framing and method-table validation that hparse
+deliberately does not; that is most of the file).
+
+Edit it **by hand**. The failure output is a delta, not a regenerated file, because
+the `why` lines are the only part that cannot be recomputed and a bulk rewrite would
+silently discard them — which is the exact failure this whole thing is here to stop.
+
 ## Where the seed corpus comes from
 
 Two arrays, kept apart on purpose. The hand-written seeds at the bottom of

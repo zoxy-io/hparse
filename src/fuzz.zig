@@ -23,10 +23,16 @@
 //!    disagreement happens to fall across a truncation boundary.
 //! 4. Reference differential against picohttpparser and llhttp: where hparse and a
 //!    reference BOTH accept, the fields must match. Only where both accept — they
-//!    disagree about what is legal by design, and those disagreements are triage
-//!    material, not failures. Two references rather than one because they are wrong
-//!    differently: picohttpparser is hand-written and block-oriented, llhttp is a
-//!    generated state machine walking one byte at a time.
+//!    disagree about what is legal by design. Two references rather than one because
+//!    they are wrong differently: picohttpparser is hand-written and block-oriented,
+//!    llhttp is a generated state machine walking one byte at a time.
+//! 5. Disagreement snapshot: everywhere oracle 4 skips — a verdict difference rather
+//!    than a field difference — is recorded in `disagreements.zig` with a required
+//!    justification, and the set is re-derived and diffed on every run. That is the
+//!    half of oracle 4 that used to go nowhere: this comment called such cases
+//!    "triage material, not failures" while nothing triaged them, which is how a
+//!    header key accepting 144 non-tchar bytes survived eight months with
+//!    picohttpparser rejecting the very same input in the very same run.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,6 +47,9 @@ const pico = @cImport({
 
 /// Seed corpus harvested from llhttp's markdown test fixtures.
 const corpus_llhttp = @import("corpus_llhttp.zig");
+
+/// Checked-in verdict disagreements; see `checkDisagreements`.
+const disagreements = @import("disagreements.zig");
 
 /// Second reference parser; see `diffRequestAgainstLlhttp`.
 const llhttp = @cImport({
@@ -998,33 +1007,33 @@ fn seed(comptime s: []const u8) []const u8 {
 }
 
 const request_corpus = [_][]const u8{
-    seed("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
-    seed("GET / HTTP/1.1\n\n"), // bare LF terminators (must reject)
-    seed("OPTIONS /hey-this-is-kinda-long-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
-    seed("POST /submit HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello"),
-    seed("DELETE /a/b/c?q=1&r=2#frag HTTP/1.1\r\nAccept: */*\r\n\r\n"),
-    seed("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-    seed("PATCH /x HTTP/1.1\r\nX:\ta\tb \t \r\n\r\n"), // OWS/HTAB edge cases
-    seed("GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n"),
-    seed("GET /index.html HTTP/1.1\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) ~zh;q=0.9,*~\r\n\r\n"),
-    seed("GET / HTTP/1.1\r\nHost"), // truncated header key
-    seed("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), // truncated path
-    seed("TRACE / HTTP/1.1\r\nA B: v\r\n\r\n"), // space in key (must reject)
-    seed("PROPFIND /dav HTTP/1.1\r\nDepth: 0\r\n\r\n"), // extension method
-    seed("M-SEARCH * HTTP/1.1\r\n\r\n"), // extension method with tchar '-'
-    seed("POSTER /x HTTP/1.1\r\n\r\n"), // registered-method prefix collision
+    "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    "GET / HTTP/1.1\n\n", // bare LF terminators (must reject)
+    "OPTIONS /hey-this-is-kinda-long-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    "POST /submit HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello",
+    "DELETE /a/b/c?q=1&r=2#frag HTTP/1.1\r\nAccept: */*\r\n\r\n",
+    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    "PATCH /x HTTP/1.1\r\nX:\ta\tb \t \r\n\r\n", // OWS/HTAB edge cases
+    "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n",
+    "GET /index.html HTTP/1.1\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) ~zh;q=0.9,*~\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost", // truncated header key
+    "GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // truncated path
+    "TRACE / HTTP/1.1\r\nA B: v\r\n\r\n", // space in key (must reject)
+    "PROPFIND /dav HTTP/1.1\r\nDepth: 0\r\n\r\n", // extension method
+    "M-SEARCH * HTTP/1.1\r\n\r\n", // extension method with tchar '-'
+    "POSTER /x HTTP/1.1\r\n\r\n", // registered-method prefix collision
 };
 
 const response_corpus = [_][]const u8{
-    seed("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
-    seed("HTTP/1.1 418 I'm a teapot\r\nHost: localhost\r\nSome-Number-Sequence: 123291429\r\n\r\n"),
-    seed("HTTP/1.0 204\r\n\r\n"), // no status message
-    seed("HTTP/1.1 301   Moved Permanently\n\n"), // multiple spaces + bare LF (must reject)
+    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    "HTTP/1.1 418 I'm a teapot\r\nHost: localhost\r\nSome-Number-Sequence: 123291429\r\n\r\n",
+    "HTTP/1.0 204\r\n\r\n", // no status message
+    "HTTP/1.1 301   Moved Permanently\n\n", // multiple spaces + bare LF (must reject)
     // The same multiple spaces, accepted. llhttp consumes exactly one of them and
     // keeps the rest in its status span where hparse skips the whole run, so this is
     // the only corpus entry that reaches the trim in `diffResponseAgainstLlhttp`.
-    seed("HTTP/1.1 301   Moved Permanently\r\nLocation: /x  \t\r\n\r\n"),
-    seed("HTTP/1.1 200 OK\r\nHost: x"), // truncated header value
+    "HTTP/1.1 301   Moved Permanently\r\nLocation: /x  \t\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nHost: x", // truncated header value
 };
 
 /// Length-prefixes a whole array of raw messages, so `corpus_llhttp.zig` can stay
@@ -1041,8 +1050,10 @@ fn seedAll(comptime inputs: []const []const u8) [inputs.len][]const u8 {
 // The hand-written seeds above pin the shapes this parser's own invariants turn on
 // and are worth reading; llhttp's are breadth, and there are two hundred of them.
 // Keeping them in separate arrays means the curated list stays legible.
-const all_request_corpus = request_corpus ++ seedAll(&corpus_llhttp.requests);
-const all_response_corpus = response_corpus ++ seedAll(&corpus_llhttp.responses);
+const all_request_inputs = request_corpus ++ corpus_llhttp.requests;
+const all_response_inputs = response_corpus ++ corpus_llhttp.responses;
+const all_request_corpus = seedAll(&all_request_inputs);
+const all_response_corpus = seedAll(&all_response_inputs);
 
 test "fuzz parseRequest" {
     return std.testing.fuzz({}, fuzzParseRequest, .{ .corpus = &all_request_corpus });
@@ -1050,4 +1061,180 @@ test "fuzz parseRequest" {
 
 test "fuzz parseResponse" {
     return std.testing.fuzz({}, fuzzParseResponse, .{ .corpus = &all_response_corpus });
+}
+
+/// What each parser made of `g`: hparse, picohttpparser, llhttp. Accepted a
+/// complete message, or did not.
+fn requestVerdicts(g: []const u8) [3]bool {
+    @disableInstrumentation();
+    var method: hparse.Method = .unknown;
+    var token: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var version: hparse.Version = .@"1.0";
+    var headers: [max_headers]hparse.Header = undefined;
+    var count: usize = 0;
+    const ours = if (hparse.parseRequest(g, &method, &token, &path, &version, &headers, &count)) |_| true else |_| false;
+
+    var p_method: [*c]const u8 = null;
+    var p_method_len: usize = 0;
+    var p_path: [*c]const u8 = null;
+    var p_path_len: usize = 0;
+    var p_minor: c_int = -1;
+    var p_headers: [max_headers]pico.phr_header = undefined;
+    var p_count: usize = max_headers;
+    const theirs = pico.phr_parse_request(@ptrCast(g.ptr), g.len, &p_method, &p_method_len, &p_path, &p_path_len, &p_minor, &p_headers, &p_count, 0) >= 0;
+
+    var record: LlhttpRecord = .{};
+    return .{ ours, theirs, runLlhttp(g, llhttp.HTTP_REQUEST, &record) != null };
+}
+
+/// `requestVerdicts` for the response side.
+fn responseVerdicts(g: []const u8) [3]bool {
+    @disableInstrumentation();
+    var version: hparse.Version = .@"1.0";
+    var status: u16 = 0;
+    var msg: ?[]const u8 = null;
+    var headers: [max_headers]hparse.Header = undefined;
+    var count: usize = 0;
+    const ours = if (hparse.parseResponse(g, &version, &status, &msg, &headers, &count)) |_| true else |_| false;
+
+    var p_minor: c_int = -1;
+    var p_status: c_int = -1;
+    var p_msg: [*c]const u8 = null;
+    var p_msg_len: usize = 0;
+    var p_headers: [max_headers]pico.phr_header = undefined;
+    var p_count: usize = max_headers;
+    const theirs = pico.phr_parse_response(@ptrCast(g.ptr), g.len, &p_minor, &p_status, &p_msg, &p_msg_len, &p_headers, &p_count, 0) >= 0;
+
+    var record: LlhttpRecord = .{};
+    return .{ ours, theirs, runLlhttp(g, llhttp.HTTP_RESPONSE, &record) != null };
+}
+
+fn findEntry(snapshot: []const disagreements.Entry, input: []const u8) ?disagreements.Entry {
+    @disableInstrumentation();
+    for (snapshot) |e| {
+        if (std.mem.eql(u8, e.input, input)) return e;
+    }
+    return null;
+}
+
+fn corpusHas(corpus: []const []const u8, input: []const u8) bool {
+    @disableInstrumentation();
+    for (corpus) |c| {
+        if (std.mem.eql(u8, c, input)) return true;
+    }
+    return false;
+}
+
+/// Prints an input as a Zig string literal, so a NEW line can be pasted straight
+/// into `disagreements.zig`.
+fn printLiteral(s: []const u8) void {
+    @disableInstrumentation();
+    for (s) |c| switch (c) {
+        '\r' => std.debug.print("\\r", .{}),
+        '\n' => std.debug.print("\\n", .{}),
+        '\t' => std.debug.print("\\t", .{}),
+        '"' => std.debug.print("\\\"", .{}),
+        '\\' => std.debug.print("\\\\", .{}),
+        0x20...0x21, 0x23...0x5b, 0x5d...0x7e => std.debug.print("{c}", .{c}),
+        else => std.debug.print("\\x{x:0>2}", .{c}),
+    };
+}
+
+/// Recomputes which corpus inputs the three parsers disagree about and holds it
+/// against `disagreements.zig`.
+///
+/// Keyed by input rather than by position, so adding a corpus seed reports one new
+/// line instead of reshuffling forty-four. The output is a delta for the same
+/// reason the snapshot is not regenerated in bulk: the `why` lines are the only
+/// part of that file that cannot be recomputed, and a bulk rewrite would drop them.
+fn checkDisagreements(
+    comptime is_request: bool,
+    corpus: []const []const u8,
+    snapshot: []const disagreements.Entry,
+) !usize {
+    @disableInstrumentation();
+    const side = if (is_request) "request" else "response";
+    var problems: usize = 0;
+
+    for (corpus) |input| {
+        if (input.len > max_input) continue;
+        const g = primary.copy(input);
+        const v = if (is_request) requestVerdicts(g) else responseVerdicts(g);
+        const unanimous = v[0] == v[1] and v[1] == v[2];
+        const entry = findEntry(snapshot, input);
+
+        if (unanimous) {
+            if (entry != null) {
+                problems += 1;
+                std.debug.print("\n  RESOLVED ({s}): all three now agree — delete this entry:\n    \"", .{side});
+                printLiteral(input);
+                std.debug.print("\"\n", .{});
+            }
+            continue;
+        }
+
+        const e = entry orelse {
+            problems += 1;
+            std.debug.print(
+                "\n  NEW ({s}): an unjustified disagreement. Explain it, then add:\n" ++
+                    "    .{{ .hparse = {}, .pico = {}, .llhttp = {}, .why = \"EXPLAIN THIS\", .input = \"",
+                .{ side, v[0], v[1], v[2] },
+            );
+            printLiteral(input);
+            std.debug.print("\" }},\n", .{});
+            if (v[0] and !v[1] and !v[2]) {
+                std.debug.print(
+                    "    ^ hparse is the ONLY parser accepting this. That was the tchar bug's\n" ++
+                        "      signature — treat it as a bug in hparse until proven otherwise.\n",
+                    .{},
+                );
+            }
+            continue;
+        };
+
+        if (e.hparse != v[0] or e.pico != v[1] or e.llhttp != v[2]) {
+            problems += 1;
+            std.debug.print(
+                "\n  CHANGED ({s}): was h={} p={} l={}, now h={} p={} l={}:\n    \"",
+                .{ side, e.hparse, e.pico, e.llhttp, v[0], v[1], v[2] },
+            );
+            printLiteral(input);
+            std.debug.print("\"\n", .{});
+        }
+    }
+
+    for (snapshot) |e| {
+        if (corpusHas(corpus, e.input)) continue;
+        problems += 1;
+        std.debug.print("\n  ORPHAN ({s}): no corpus seed has these bytes any more — delete this entry:\n    \"", .{side});
+        printLiteral(e.input);
+        std.debug.print("\"\n", .{});
+    }
+
+    return problems;
+}
+
+test "reference disagreements match the checked-in snapshot" {
+    var problems = try checkDisagreements(true, &all_request_inputs, &disagreements.requests);
+    problems += try checkDisagreements(false, &all_response_inputs, &disagreements.responses);
+
+    // An unexplained entry is the state this whole file exists to prevent, so it
+    // fails the same way an unrecorded disagreement does.
+    for (disagreements.requests ++ disagreements.responses) |e| {
+        if (e.why.len != 0 and !std.mem.eql(u8, e.why, "EXPLAIN THIS") and !std.mem.eql(u8, e.why, "TODO")) continue;
+        problems += 1;
+        std.debug.print("\n  UNJUSTIFIED: an entry still has a placeholder `why`:\n    \"", .{});
+        printLiteral(e.input);
+        std.debug.print("\"\n", .{});
+    }
+
+    if (problems != 0) {
+        std.debug.print(
+            "\n  {d} disagreement(s) moved. Edit src/disagreements.zig by hand — the\n" ++
+                "  existing `why` lines are not reproducible and must survive.\n\n",
+            .{problems},
+        );
+        return error.DisagreementSnapshotStale;
+    }
 }
