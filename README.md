@@ -28,21 +28,24 @@ zig build bench -Diters=10000000  # heavier workload per run
 
 This builds and compares four parsers on the same request workload: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`), **picohttpparser** and **llhttp** (both compiled from C by Zig's bundled clang).
 
-Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run:
+Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run, 10 runs per parser:
 
 ```
 name                    min       mean        max      rel
 ----------------------------------------------------------
-hparse               0.084s     0.088s     0.100s    1.00x
-picohttpparser       0.116s     0.125s     0.132s    1.37x
-llhttp               0.236s     0.242s     0.272s    2.80x
-std.http             0.702s     0.704s     0.706s    8.35x
+hparse               0.067s     0.072s     0.082s    1.00x
+picohttpparser       0.118s     0.125s     0.139s    1.76x
+llhttp               0.235s     0.242s     0.260s    3.51x
+std.http             0.709s     0.733s     0.764s   10.59x
 ```
+
+Compare bands across runs, never single numbers: an interleaved repeat of the run
+above put hparse at 0.064-0.080s and left the other three where they are.
 
 For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`.
 
 > [!IMPORTANT]
-> **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~11x slower. The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
+> **Zig 0.16's default self-hosted x86_64 backend scalarizes `@Vector` code** — no SIMD instructions are emitted and hparse runs ~45x slower (0.065-0.081s vs 3.17-3.21s on the benchmark above, three interleaved runs). The benchmarks force the LLVM backend (`use_llvm = true`), and you should do the same in release builds that consume this library (see Installation below) until the self-hosted backend learns vector lowering.
 
 ## Fuzzing
 
@@ -147,7 +150,7 @@ For fast parsing in release builds on x86_64, force the LLVM backend on the exec
 ```zig
 const exe = b.addExecutable(.{
     .name = "my-app",
-    .use_llvm = true, // hparse relies on SIMD; ~11x faster than the self-hosted backend
+    .use_llvm = true, // hparse relies on SIMD; ~45x faster than the self-hosted backend
     .root_module = exe_mod,
 });
 ```
