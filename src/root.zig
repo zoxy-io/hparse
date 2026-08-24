@@ -144,25 +144,39 @@ pub const ParseRequestError = error{ Incomplete, Invalid, TooManyHeaders };
 /// on the path it was already taking rather than moving to one nobody has run.
 const is_aarch64 = builtin.cpu.arch == .aarch64;
 
-/// Index of the first rejected lane in `bad`, or `vec_size` when every lane is
-/// accepted — the scan primitive every vectorized loop below is built on.
+/// Index of the first rejected lane in `bad`, which must have at least one.
 ///
-/// Two lowerings, because the two targets disagree about what a lane mask costs.
-/// x86 has `pmovmskb`: one instruction for a bit per lane, so bitcasting the
-/// compare result straight to an integer is already optimal. AArch64 has no such
-/// instruction, and LLVM lowers `@bitCast(@Vector(N, u1))` into
-/// `and`/`ext`/`zip1`/`addv` — a horizontal reduction, and it sits in the middle
-/// of a loop-carried dependency chain, since the next chunk's address is what the
-/// reduction produces. `shrn` narrowing each pair of 16-bit lanes down four bits
-/// leaves one nibble per input byte in a single 64-bit register, in one
-/// instruction and one v->x move. Measured on the `bench/` request, M3 Max, five
-/// interleaved runs comparing minima: 162-168 -> 130-133 ns/parse, three quarters
-/// of the gap against picohttpparser (122-123).
+/// Reached once per scan, not once per chunk. The loops below advance by a
+/// constant `vec_size` for as long as every lane is accepted, and only ask for a
+/// position on the chunk they stop in — which is what keeps the mask out of the
+/// loop-carried dependency chain, since a constant stride is an address the next
+/// load does not have to wait for. That is the shape picohttpparser's SSE4.2 loop
+/// has for the same reason: `pcmpestri` costs about ten cycles, so it too advances
+/// by a constant and reads the returned index only on the way out.
+///
+/// Being off the chain does not make the lowering free, because header values are
+/// short — most scans stop inside their first chunk, so this runs about as often
+/// as the loop does. Hence two lowerings, because the two targets disagree about
+/// what a lane mask costs. x86 has `pmovmskb`: one instruction for a bit per lane,
+/// so bitcasting the compare result straight to an integer is already optimal.
+/// AArch64 has no such instruction, and LLVM lowers `@bitCast(@Vector(N, u1))`
+/// into `and`/`ext`/`zip1`/`addv` plus a cross-domain `fmov`. `shrn`, narrowing
+/// each pair of 16-bit lanes down four bits, leaves one nibble per input byte in a
+/// single 64-bit register instead.
 ///
 /// Do not collapse the two branches. The nibble form on x86 costs a `psrlw` and a
 /// `pshufb` on top of the `pmovmskb` it cannot avoid, and the bit form on AArch64
-/// costs the reduction above.
+/// costs the reduction above. On the `bench/` request, M3 Max, four interleaved
+/// runs comparing minima: 91-93 ns/parse with one portable bit-mask form, 79-82
+/// with the split — 13%, down from the 20% the same split was worth against the
+/// old loop shape (a separate five-run set, 162-168 -> 130-133). Neither pair is
+/// reproducible from this tree: both need a build with this branch taken out, and
+/// no build option reaches one.
 inline fn firstRejected(bad: @Vector(vec_size, bool)) usize {
+    // Stated positively at the entry the callers cross, so a future caller that
+    // drops the `@reduce` guard fails here rather than inside the mask.
+    assert(@reduce(.Or, bad));
+
     const adv_by = if (comptime is_aarch64) blk: {
         const Vec = @Vector(vec_size, u8);
         const Half = @Vector(vec_size / 2, u16);
@@ -172,16 +186,16 @@ inline fn firstRejected(bad: @Vector(vec_size, bool)) usize {
         const bytes: Vec = @select(u8, bad, @as(Vec, @splat(0xff)), @as(Vec, @splat(0)));
         const nibbles: NibbleMask = @bitCast(@as(Narrow, @truncate(@as(Half, @bitCast(bytes)) >> @as(Half, @splat(4)))));
 
-        // Four mask bits per input byte, so the tail count divides by four. An
-        // all-accepted chunk gives zero, whose @ctz is the full width: exactly
-        // `vec_size`, the same "consumed everything" answer as the bit form.
+        // Four mask bits per input byte, so the tail count divides by four.
         break :blk @ctz(nibbles) >> 2;
     } else @ctz(@as(VectorInt, @bitCast(@as(@Vector(vec_size, u1), @intFromBool(bad)))));
 
-    // Every caller feeds this straight to `Cursor.advance`, which does not check
-    // bounds — so the one place both lowerings meet is the place to say that
-    // neither can hand out an advance past the chunk it was given.
-    assert(adv_by <= vec_size);
+    // Both lowerings answer "no lane rejected" with the full width, and both
+    // callers have already ruled that out with `@reduce(.Or, bad)` — so a result
+    // of `vec_size` here means the mask and the reduction disagreed about the same
+    // bytes. Worth catching where they meet, because the value goes straight to
+    // `Cursor.advance`, which does not check bounds.
+    assert(adv_by < vec_size);
     return adv_by;
 }
 
@@ -447,14 +461,15 @@ const Cursor = struct {
                     bad |= chunk == @as(Vec, @splat(c));
                 }
 
-                // First rejected lane; an all-accepted chunk is target material all
-                // the way through and yields the vector width.
-                const adv_by = firstRejected(bad);
-
-                cursor.advance(adv_by);
-                if (adv_by != vec_size) {
+                // The advance is a constant for as long as the chunks are clean, so
+                // the next load's address never waits on the lane mask. Only the
+                // chunk that stops the scan pays for a position.
+                if (@reduce(.Or, bad)) {
+                    cursor.advance(firstRejected(bad));
                     return;
                 }
+
+                cursor.advance(vec_size);
             }
         }
 
@@ -613,15 +628,16 @@ const Cursor = struct {
                 // sees the same reject-mask convention `matchPath` hands it.
                 const bad = ~((chunk > full_31) | (chunk == tabs)) | (chunk == deletes);
 
-                const adv_by = firstRejected(bad);
-
-                // advance the cursor
-                cursor.advance(adv_by);
-
-                // chunk includes an invalid char or CRLF, we're done
-                if (adv_by != vec_size) {
+                // chunk includes an invalid char or CRLF, we're done. Constant
+                // stride on the clean path, position only on the chunk that stops
+                // the scan — see `firstRejected` for why that shape matters.
+                if (@reduce(.Or, bad)) {
+                    cursor.advance(firstRejected(bad));
                     return;
                 }
+
+                // advance the cursor
+                cursor.advance(vec_size);
             }
         }
 

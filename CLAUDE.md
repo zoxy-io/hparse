@@ -195,32 +195,49 @@ import was cheap, and the reason a corpus from any other parser would be too.
   reason the code looks like this, not a number to re-run. picohttpparser and
   httparse both scan field names byte at a time for the same reason. Reach for
   SIMD here again only with your own benchmark.
+- **The vector loops advance by a constant, and only the chunk that stops a scan
+  pays for a position.** This is the single biggest thing in the scanning code.
+  Both loops used to end `cursor.advance(firstRejected(bad))` unconditionally, so
+  every iteration's next load address waited on the whole classify -> mask ->
+  `@ctz` chain even when nothing was rejected — latency-bound where it should have
+  been throughput-bound. Asking `@reduce(.Or, bad)` first and advancing by a
+  literal `vec_size` on the clean path moves that chain off the loop-carried
+  dependency and onto a predicted-not-taken branch. On the `bench/` request, M3
+  Max, five interleaved runs comparing minima: 141-142 -> 79-81 ns/parse, and
+  193-194 -> 88-89 on a 127-byte request-target, against picohttpparser's 125-127
+  and 171-172, and reproducible from the tree by rebuilding at the parent commit.
+  It is not an AArch64 fix: the same data dependency was on the x86 path, just
+  shorter, and the restructure removes `tzcnt` and the pointer update from that
+  loop body too (checked by cross-compiling to `x86_64_v3` and diffing).
+  picohttpparser has had this shape all along and for the same reason — `pcmpestri`
+  costs about ten cycles, so it advances `buf += 16` on the clean path and reads
+  the returned index only on the way out.
 - **Lane masks are extracted two different ways, and the split is load-bearing.**
-  Every vector loop ends by asking "which lane rejected first", and `firstRejected`
-  answers it twice. x86 has `pmovmskb`, so bitcasting the compare result to a
-  bit-per-lane integer is one instruction and already optimal. AArch64 has no such
-  instruction: LLVM lowers `@bitCast(@Vector(N, u1))` into `and`/`ext`/`zip1`/`addv`
-  plus a cross-domain `fmov` — a horizontal reduction sitting inside a
-  loop-carried dependency chain, because the reduction's result *is* the next
-  chunk's address. `matchHeaderValue` got a second one on top (`uminv`+`fmov`,
-  purely to evaluate `adv_by != vec_size`), which is how a 16-byte NEON step ended
-  up costing more than picohttpparser's 8x-unrolled scalar byte loop, whose loads
-  are all independent and therefore throughput-bound rather than latency-bound.
-  `shrn`, narrowing each pair of 16-bit lanes down four bits, leaves one nibble per
-  input byte in a single 64-bit register instead. On the `bench/` request, M3 Max,
-  five interleaved runs comparing minima: 162-168 -> 130-133 ns/parse. Reproducible
-  from the tree by rebuilding at the parent commit. Do not collapse the branches —
-  the nibble form on x86 costs a `psrlw` and a `pshufb` on top of the `pmovmskb` it
-  cannot avoid.
-- **This was invisible for as long as it was because nothing benchmarks the scalar
-  tier.** `-Duse-vectors=false` was 19% *faster* than the shipped build on aarch64,
-  and the option is described above as existing only so the fuzz differential can
-  reach an otherwise-unreachable tier. `bench/build.zig` does not forward it to the
-  `hparse` dependency, so no `zig build bench` run has ever compared the two tiers
-  the parser actually chooses between. A vectorized scan is a hypothesis about the
-  target, not a win; on aarch64 `matchPath` still loses to its own scalar tier on a
-  long request-target (176-177 vs 168-171 ns/parse on a 127-byte path) even with
-  the mask fixed, because pchar takes eight compares per chunk to classify.
+  `firstRejected` answers "which lane rejected first" twice. x86 has `pmovmskb`, so
+  bitcasting the compare result to a bit-per-lane integer is one instruction and
+  already optimal. AArch64 has no such instruction: LLVM lowers
+  `@bitCast(@Vector(N, u1))` into `and`/`ext`/`zip1`/`addv` plus a cross-domain
+  `fmov`. `shrn`, narrowing each pair of 16-bit lanes down four bits, leaves one
+  nibble per input byte in a single 64-bit register instead. Four interleaved runs,
+  minima: 91-93 ns/parse portable, 79-82 split — 13%, down from the 20% the same
+  split was worth against the old loop shape (a separate five-run set, 162-168 ->
+  130-133). It shrank but did not vanish, because header values are short enough
+  that most scans stop inside their first chunk, so the position lookup runs about
+  as often as the loop does. Unlike the bullet above, this pair is **not**
+  reproducible from the tree: it needs a build with the arch branch taken out, and
+  no build option reaches that. Do not collapse the branches — the nibble form on
+  x86 costs a `psrlw` and a `pshufb` on top of the `pmovmskb` it cannot avoid.
+- **`std.simd.firstTrue` is not the shortcut it looks like.** It does
+  `@reduce(.Or, vec)` and then `@select` plus `@reduce(.Min, indices)` — two
+  horizontal reductions, which is worse on AArch64 than either form above.
+- **Nothing benchmarks the scalar tier, and that is how this hid.**
+  `-Duse-vectors=false` was 19% *faster* than the shipped build on aarch64 before
+  the two fixes above, and the option is described further up as existing only so
+  the fuzz differential can reach an otherwise-unreachable tier. `bench/build.zig`
+  does not forward it to the `hparse` dependency, so no `zig build bench` run has
+  ever compared the two tiers the parser actually chooses between. A vectorized
+  scan is a hypothesis about the target, not a win, and this one was wrong for
+  months.
 - **The path-differential oracle no longer covers header keys.** It diffs a
   vectors-on build against a vectors-off one, and `matchHeaderKey` is now the
   same code in both. That is worth knowing precisely because both bugs this
