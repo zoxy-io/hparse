@@ -79,11 +79,41 @@ comptime {
     if (long_value.len != 390) @compileError("long_value must stay 390 bytes");
 }
 
+/// A current browser navigation request, where `chrome` above is a 2013 capture.
+/// The difference that matters here is not size, it is the value-length
+/// distribution: `chrome` has no header value shorter than nine bytes, while a
+/// modern request carries a pile of one- and two-byte `Sec-*` and client-hint
+/// values. Any change that trades cost on long values against cost on short ones
+/// reads as a flat loss on `chrome` alone, which is how this shape came to exist.
+const chrome_modern =
+    "GET /api/session HTTP/1.1\r\n" ++
+    "Host: example.com\r\n" ++
+    "Connection: keep-alive\r\n" ++
+    "sec-ch-ua: \"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"\r\n" ++
+    "sec-ch-ua-mobile: ?0\r\n" ++
+    "sec-ch-ua-platform: \"macOS\"\r\n" ++
+    "Upgrade-Insecure-Requests: 1\r\n" ++
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n" ++
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n" ++
+    "Sec-Fetch-Site: same-origin\r\n" ++
+    "Sec-Fetch-Mode: navigate\r\n" ++
+    "Sec-Fetch-User: ?1\r\n" ++
+    "Sec-Fetch-Dest: document\r\n" ++
+    "Accept-Encoding: gzip, deflate, br, zstd\r\n" ++
+    "Accept-Language: en-US,en;q=0.9\r\n" ++
+    "Cookie: session=abc123; theme=dark\r\n" ++
+    "\r\n";
+
 pub const all = [_]Workload{
     .{
         .name = "chrome",
         .request = chrome,
         .loads = "everything at once; the historical baseline",
+    },
+    .{
+        .name = "chrome-modern",
+        .request = chrome_modern,
+        .loads = "realistic traffic with short Sec-* values",
     },
     .{
         .name = "long-path",

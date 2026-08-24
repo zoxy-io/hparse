@@ -72,6 +72,47 @@ pub const vector_size: usize = vec_size;
 /// `vec_size` as unsigned integer type.
 const VectorInt = std.meta.Int(.unsigned, vec_size);
 
+/// How many bytes `matchHeaderValue` scans scalar before it loads a vector chunk.
+///
+/// The vector loop gates on `hasLength(vec_size)`, which asks how much BUFFER
+/// remains, not how long the value is. A one-byte value in the middle of a large
+/// head therefore paid a full 32-byte load, five vector ops, a lane mask and a
+/// `@ctz` to find a CR one byte away — about fifteen cycles of pure latency, with
+/// nothing to overlap it against, because the next header's key cannot be scanned
+/// until this value's end is known. Two scalar iterations end that value first.
+///
+/// Two is small on purpose, and the cost model says why: the prefix is a flat tax
+/// of roughly 1.4 cycles per byte on every value longer than it, paid to save
+/// ~15 cycles on every value shorter. At 8 it cost `chrome` 19%. At 2 it catches
+/// the one- and two-byte values that dominate the win and taxes the rest barely
+/// at all.
+///
+/// `matchPath` deliberately does NOT do this. The same prefix there COSTS 12% on
+/// `long-path` and buys nothing back: a target only benefits if it is one or two
+/// bytes, and outside `GET /` that does not happen. Values are the opposite — one-
+/// and two-byte ones are everywhere — which is the whole reason the two scans get
+/// different treatment.
+///
+/// Measured, `bench/`, Core Ultra 7 258V, 12 interleaved alternations of two
+/// builds, comparing minima. Ratios are new/old, so above 1.00 is faster:
+///
+///   many-tiny      2.12x      chrome-modern  1.03x
+///   long-keys      1.71x      long-path      1.01x
+///                             minimal        1.00x
+///                             long-values    0.97x
+///                             chrome         0.97x
+///
+/// The two realistic requests disagree by design, and that disagreement is the
+/// whole argument for the constant. `chrome` is a 2013 capture whose shortest
+/// header value is nine bytes, so it sees only the tax; `chrome-modern` carries
+/// the `?0`, `?1` and `1` values a current browser sends, and comes out ahead.
+/// Worst case anywhere is 3%.
+///
+/// `long-keys` swung between 1.09x and 1.71x across rebuilds that did not touch
+/// the parser, so read it as "clearly positive" and not as a number. Code layout
+/// moves the scalar loops by tens of percent and nothing here pins it down.
+const scalar_prefix = 2;
+
 /// HTTP methods.
 ///
 /// The nine registered methods below are matched as 4-byte magic integers
@@ -591,8 +632,9 @@ const Cursor = struct {
         }
     }
 
-    /// Validates header values: a vector tier and a byte-at-a-time tail, nothing
-    /// in between.
+    /// Validates header values: a short byte-at-a-time prefix, then a vector tier,
+    /// then a byte-at-a-time tail. Nothing else in between — see `scalar_prefix`
+    /// for why the prefix is there and why `matchPath` has no equivalent.
     ///
     /// There used to be a SWAR tier here, and deleting it was faster in both builds
     /// — 0.99x with vectors on, and 0.70x with `-Duse-vectors=false`, where it was
@@ -608,8 +650,25 @@ const Cursor = struct {
     /// bought nothing, and had its own tier to diverge in. If you reinstate it,
     /// bring numbers for both builds.
     inline fn matchHeaderValue(cursor: *Cursor) void {
-        // Unlike headers keys, prefer vectors initially when validating header values if possible.
         if (comptime use_vectors) {
+            // Short values end here, before the vector loop below charges a chunk
+            // for them. See `scalar_prefix`.
+            // Counter-bounded, not pointer-bounded. At a prefix this short the
+            // `end - idx`, `@min`, `idx + n` setup of a pointer bound costs more
+            // than the two iterations it exists to bound — measured 0.90x against
+            // 0.97x on `chrome`. A longer prefix would want the other form.
+            var scanned: usize = 0;
+            while (scanned < scalar_prefix and cursor.end - cursor.idx > 0) : (scanned += 1) {
+                if (!isValidValueChar(cursor.char())) {
+                    return;
+                }
+                cursor.advance(1);
+            }
+            // Either the prefix ran out or the buffer did; an invalid byte returns
+            // above rather than falling through, so the vector loop below can only
+            // ever start on a byte this loop accepted.
+            assert(scanned == scalar_prefix or cursor.end - cursor.idx == 0);
+
             while (cursor.hasLength(vec_size)) {
                 // Fill a vector with TAB (\t, 9).
                 const tabs: @Vector(vec_size, u8) = @splat(0x9);
@@ -1993,6 +2052,87 @@ test "parseRequest: OWS/HTAB handling in header values (RFC 7230)" {
         _ = try parseRequest(c.req, &method, &method_token, &path, &version, &headers, &header_count);
         try testing.expect(header_count == 1);
         try testing.expectEqualStrings(c.expected, headers[0].value);
+    }
+}
+
+test "parseRequest: header values at the scalar_prefix boundary" {
+    // `matchHeaderValue` hands the first `scalar_prefix` bytes to a byte loop and
+    // everything after to the vector loop, so the lengths either side of that seam
+    // are where the two tiers could disagree about the same bytes.
+    //
+    // Every case is padded with a trailing header. Without it the vector loop is
+    // unreachable: it gates on `hasLength(vec_size)`, which asks how much BUFFER
+    // remains, so a 25-byte request never enters it and the "boundary" would be
+    // tested entirely against the scalar tail — the same mistake `scalar_prefix`
+    // exists because of.
+    const pad = "Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+    const Case = struct { value: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        // Empty: the seam is crossed before a single byte is accepted.
+        .{ .value = "", .expected = "" },
+        // Ends inside the prefix.
+        .{ .value = "a", .expected = "a" },
+        // Exactly `scalar_prefix` bytes: the terminator is the first thing the
+        // vector loop is asked about.
+        .{ .value = "ab", .expected = "ab" },
+        // One past it: the first byte the vector loop actually classifies.
+        .{ .value = "abc", .expected = "abc" },
+    };
+
+    inline for (cases) |c| {
+        const req = "GET / HTTP/1.1\r\nX: " ++ c.value ++ "\r\n" ++ pad ++ "\r\n";
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        _ = try parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count);
+        try testing.expect(header_count == 2);
+        try testing.expectEqualStrings(c.expected, headers[0].value);
+    }
+}
+
+test "parseRequest: DEL just past the scalar_prefix seam is still refused" {
+    // Padded for the same reason as above, and deliberately at offset 2 — the
+    // first byte the vector tier sees. An earlier version of this test put it at
+    // offset 0 in a 25-byte request, where the vector tier never runs at all.
+    const pad = "Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+
+    inline for (.{ "\x7f", "a\x7f", "ab\x7f", "abc\x7f" }) |value| {
+        const req = "GET / HTTP/1.1\r\nX: " ++ value ++ "\r\n" ++ pad ++ "\r\n";
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(error.Invalid, parseRequest(req, &method, &method_token, &path, &version, &headers, &header_count));
+    }
+}
+
+test "parseRequest: buffer truncated inside the scalar_prefix window" {
+    // The prefix loop can also run out of buffer rather than out of budget, which
+    // is the path that must still report Incomplete rather than a short value.
+    const heads = [_][]const u8{
+        "GET / HTTP/1.1\r\nX:",
+        "GET / HTTP/1.1\r\nX: ",
+        "GET / HTTP/1.1\r\nX: a",
+        "GET / HTTP/1.1\r\nX: ab",
+        "GET / HTTP/1.1\r\nX: abc",
+    };
+
+    for (heads) |head| {
+        var method: Method = .unknown;
+        var method_token: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var version: Version = .@"1.0";
+        var headers: [8]Header = undefined;
+        var header_count: usize = 0;
+
+        try testing.expectError(error.Incomplete, parseRequest(head, &method, &method_token, &path, &version, &headers, &header_count));
     }
 }
 

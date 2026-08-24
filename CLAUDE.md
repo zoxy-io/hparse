@@ -212,8 +212,40 @@ import was cheap, and the reason a corpus from any other parser would be too.
   formulation needs six subtract-and-compares plus three equalities to say the
   same thing. So the measurement above stands, the explanation for it does not,
   and the gap is now visible in the tree instead of being asserted in a comment.
-  Reach for SIMD here again only with your own benchmark — but there is now a
-  workload that would show it working.
+  Reach for SIMD here again only with your own benchmark. There is now a workload
+  that would show it working, and it has been tried since: see the next bullet.
+- **Vectorizing the header-key scan was tried again, with the harness, and lost.**
+  Not the exact-tchar classifier the bullet above describes — picohttpparser's own
+  shape: a mask accepting alnum, `-` and `_` (all of which ARE tchar, so it can
+  only ever stop the scan early, never run past a byte the exact table rejects),
+  falling into the `key_map` loop from wherever it stopped. Approximate wide,
+  verify narrow. Twelve interleaved alternations, minima, against the shipped
+  build:
+
+  | workload | ratio |
+  |---|---|
+  | `long-keys` | **1.91x** |
+  | `chrome` | 0.95x |
+  | `long-path` | 0.94x |
+  | `long-values` | 0.89x |
+  | `minimal` | 0.88x |
+  | `chrome-modern` | **0.84x** |
+
+  It wins big on the one synthetic shape built to favour it and loses on both
+  realistic requests, `chrome-modern` worst at 16%. The reason is the same cost
+  model as `scalar_prefix`: a vector chunk is ~15 cycles of latency with nothing
+  to overlap, the byte loop is ~1.4 cycles per byte, so the crossover is around
+  twenty bytes and real field names are four to twenty. `long-keys` uses 41-byte
+  names, which is past the crossover and is exactly why it was built — as an
+  instrument, not as a claim about traffic.
+
+  One thing that fell out and generalizes: bounding the scalar part with a counter
+  (`scanned < N`) rather than a pointer adds an increment and a compare to every
+  byte of the hottest loop in the parser, and cost 20% on `chrome-modern` on its
+  own. But at `scalar_prefix`'s length of two the pointer form is the slower one,
+  because its `end - idx`/`@min`/`idx + n` setup outweighs the two iterations it
+  bounds — 0.90x against 0.97x. Which form is cheaper depends on the length, and
+  both are in the tree for that reason.
 - **The vector loops advance by a constant, and only the chunk that stops a scan
   pays for a position.** This is the single biggest thing in the scanning code.
   Both loops used to end `cursor.advance(firstRejected(bad))` unconditionally, so
@@ -263,18 +295,19 @@ import was cheap, and the reason a corpus from any other parser would be too.
   | `long-keys` | 166.8 ns | **116.5 ns** |
   | `many-tiny` | 134.1 ns | **60.3 ns** |
 
-  The last two rows are the finding: on requests whose header values are a few
-  bytes long, turning the vector tier **off** is up to 2.2x faster. The mechanism
-  is that `matchHeaderValue` gates its vector loop on `hasLength(vec_size)`, which
-  asks how much *buffer* remains, not how long the value is — so a 1-byte value
-  sitting anywhere but the very end of the head still pays a 32-byte load, five
-  vector ops, a `pmovmskb` and a `@ctz` to find a CR one byte away. `chrome` hides
-  it because its two long values (71 and 120 bytes) more than pay for the seven
-  short ones. Real traffic has a lot of short header values, so this is worth
-  fixing rather than filing; the obvious shape is a few scalar iterations before
-  entering the vector loop, which costs long values almost nothing. Not attempted
-  yet — measure it, do not assume it. A vectorized scan is a hypothesis about the
-  target, not a win, and this one is wrong for a whole class of input.
+  The last two rows were the finding, and `scalar_prefix` is the fix: on requests
+  whose header values are a few bytes long, turning the vector tier **off** used to
+  be up to 2.2x faster, because `matchHeaderValue` gates its vector loop on
+  `hasLength(vec_size)` — how much *buffer* remains, not how long the value is — so
+  a 1-byte value anywhere but the very end of the head paid a 32-byte load, five
+  vector ops, a `pmovmskb` and a `@ctz` to find a CR one byte away. Two scalar
+  iterations first close most of that gap; `many-tiny` is 2.12x faster than it was
+  and now beats the scalar tier outright. The rows above are the pre-fix build and
+  are kept as the measurement that motivated the constant, not as current numbers.
+
+  What stays true is the habit: a vectorized scan is a hypothesis about the target,
+  not a win. This one was wrong for a whole class of input for months, and the only
+  reason anyone found out is that the option finally reached the benchmark.
 - **The path-differential oracle no longer covers header keys.** It diffs a
   vectors-on build against a vectors-off one, and `matchHeaderKey` is now the
   same code in both. That is worth knowing precisely because both bugs this

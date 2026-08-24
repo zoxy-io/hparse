@@ -36,10 +36,10 @@ Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per 
 chrome — everything at once; the historical baseline, 430 bytes
 name                    min       mean        max      rel
 ----------------------------------------------------------
-hparse              68.9 ns    76.9 ns    80.6 ns    1.00x
-picohttpparser     113.3 ns   121.9 ns   125.7 ns    1.64x
-llhttp             226.1 ns   238.9 ns   243.5 ns    3.28x
-std.http           602.7 ns   606.7 ns   618.5 ns    8.75x
+hparse              73.3 ns    80.6 ns    87.6 ns    1.00x
+picohttpparser     115.6 ns   126.5 ns   131.2 ns    1.58x
+llhttp             238.4 ns   240.7 ns   243.8 ns    3.25x
+std.http           620.7 ns   627.8 ns   637.4 ns    8.47x
 ```
 
 Compare bands across runs, never single numbers.
@@ -50,14 +50,17 @@ Compare bands across runs, never single numbers.
 
 | workload | loads | hparse | picohttpparser |
 |---|---|---|---|
-| `chrome` | everything at once | **68.1 ns** | 116.7 ns |
-| `long-path` | `matchPath`, 127-byte target | **9.4 ns** | 26.4 ns |
-| `long-keys` | `matchHeaderKey`, 8 × 41-byte names | 166.8 ns | **96.6 ns** |
-| `long-values` | `matchHeaderValue`, 4 × 390-byte values | **52.2 ns** | 237.7 ns |
-| `many-tiny` | per-header overhead, 24 headers | **134.1 ns** | 279.4 ns |
-| `minimal` | fixed per-parse cost | **4.9 ns** | 17.1 ns |
+| `chrome` | everything at once (2013 capture) | **76.1 ns** | 115.9 ns |
+| `chrome-modern` | realistic traffic, short `Sec-*` values | **119.7 ns** | 184.2 ns |
+| `long-path` | `matchPath`, 127-byte target | **9.9 ns** | 27.0 ns |
+| `long-keys` | `matchHeaderKey`, 8 × 41-byte names | 101.9 ns | **93.9 ns** |
+| `long-values` | `matchHeaderValue`, 4 × 390-byte values | **54.1 ns** | 231.5 ns |
+| `many-tiny` | per-header overhead, 24 headers | **63.7 ns** | 273.1 ns |
+| `minimal` | fixed per-parse cost | **4.9 ns** | 18.2 ns |
 
-They are not realistic traffic and are not meant to be — `chrome` is the one that stands in for that. They are instruments. `long-keys` is the shape that matters most: it is the one workload where picohttpparser is faster, because hparse scans field names a byte at a time while picohttpparser vectorizes that scan with SSE4.2 `pcmpestri` over eight ranges and only consults its exact token table at the byte where the scan stopped.
+Most of these are not realistic traffic and are not meant to be — they are instruments. `chrome` and `chrome-modern` are the two that stand in for real requests, and they are both here because they disagree: `chrome` is a 2013 capture whose shortest header value is nine bytes, while a current browser sends a pile of one- and two-byte `Sec-*` and client-hint values. Any change that trades cost on long fields against cost on short ones looks like a flat loss on `chrome` alone.
+
+`long-keys` is the one workload where picohttpparser is still ahead, because hparse scans field names a byte at a time while picohttpparser vectorizes that scan with SSE4.2 `pcmpestri` over eight ranges and only consults its exact token table at the byte where the scan stopped. Vectorizing it here has been tried, with this harness, and lost 16% on `chrome-modern` to win 91% on `long-keys` — one `pcmpestri` tests eight ranges, and the portable `@Vector` equivalent cannot. See CLAUDE.md for the measurement.
 
 For deeper per-metric analysis (cycles, instructions, cache), point [POOP](https://github.com/andrewrk/poop) at the binaries in `bench/zig-out/bin/` after `zig build`; each takes an optional workload name as its one argument.
 
