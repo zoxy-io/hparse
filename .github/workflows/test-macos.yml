@@ -19,5 +19,15 @@ jobs:
         with:
           version: 0.16.0
 
+      # `--test-timeout 5m` raises the build runner's watchdog, and not because
+      # any test here is slow — the unit tests are about 100ms of CPU. The
+      # watchdog measures wall clock spent waiting for the test binary's FIRST
+      # response, before any test is active (`std/Build/Step/Run.zig`:
+      # `@max(unit_test_timeout_ns, 60s)`). On a cold cache this job is also
+      # compiling llhttp's 314KB of generated C, picohttpparser and two LLVM
+      # test binaries, and a freshly spawned test process on a two-core runner
+      # can simply not be scheduled in time. That fired once on Windows at 62s
+      # and passed on re-run with a warm cache, which is a thin margin, not a
+      # fluke to re-run past.
       - name: Run Tests
-        run: zig build test -Dtarget=${{ matrix.target }}
+        run: zig build test -Dtarget=${{ matrix.target }} --test-timeout 5m

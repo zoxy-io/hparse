@@ -19,18 +19,28 @@ jobs:
         with:
           version: 0.16.0
 
+      # `--test-timeout 5m` raises the build runner's watchdog, and not because
+      # any test here is slow — the unit tests are about 100ms of CPU. The
+      # watchdog measures wall clock spent waiting for the test binary's FIRST
+      # response, before any test is active (`std/Build/Step/Run.zig`:
+      # `@max(unit_test_timeout_ns, 60s)`). On a cold cache this job is also
+      # compiling llhttp's 314KB of generated C, picohttpparser and two LLVM
+      # test binaries, and a freshly spawned test process on a two-core runner
+      # can simply not be scheduled in time. That fired once on Windows at 62s
+      # and passed on re-run with a warm cache, which is a thin margin, not a
+      # fluke to re-run past.
       - name: Run Tests
-        run: zig build test -Dtarget=${{ matrix.target }}
+        run: zig build test -Dtarget=${{ matrix.target }} --test-timeout 5m
 
       # The seed corpus through the fuzz oracles: deterministic, a couple of
       # seconds, and the gate that was missing. The guard-page and consumed-
       # length oracles found an accepted empty request-target that had been
       # reachable the whole time — they were simply never run in CI.
       - name: Fuzz corpus
-        run: zig build fuzz -Dtarget=${{ matrix.target }}
+        run: zig build fuzz -Dtarget=${{ matrix.target }} --test-timeout 5m
 
       # The SWAR/scalar tier. `suggestVectorLength` is non-null on every target
       # here, so without forcing it off the scalar half of each
       # `if (comptime use_vectors)` is never executed by any other job.
       - name: Run tests (scalar tier)
-        run: zig build test -Dtarget=${{ matrix.target }} -Duse-vectors=false
+        run: zig build test -Dtarget=${{ matrix.target }} -Duse-vectors=false --test-timeout 5m
