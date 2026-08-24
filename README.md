@@ -88,6 +88,41 @@ carries the method's raw bytes. Line terminators are strictly CRLF — a bare LF
 is rejected as `error.Invalid` (accepting both is a request-smuggling
 ingredient).
 
+Header field names must be RFC 9110 `token`, and the request-target must be RFC
+3986 `pchar` plus the delimiters a target is built from (`/`, `?`, `%`) and a
+tolerated `#`, `[`, `]`. Both are stricter than most parsers: a target containing
+`"`, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`, `}` or raw non-ASCII is rejected rather
+than passed through. The motivating case is `\`, which some servers normalize to
+`/` — a proxy and an origin reading two different paths out of one target is the
+same failure as disagreeing about a line terminator. Note this does **not** make
+path-based routing safe by itself: hparse never percent-decodes and never resolves
+dot-segments, so a caller matching on the target must normalize first.
+
+## What hparse does not check
+
+hparse parses the request/status line and headers and validates their **syntax** —
+CRLF terminators, `token` field names, `pchar` targets. It never interprets what it
+parsed. A successful parse means "these bytes are well-formed", and nothing else. At
+a trust boundary the rest is yours:
+
+* **Framing.** No `Content-Length` or `Transfer-Encoding` handling whatsoever — both
+  arrive as ordinary headers, unexamined. `Content-Length: 4 2` parses. So do
+  duplicate and mutually contradictory `Content-Length` / `Transfer-Encoding`
+  headers. Deriving a body length from them, and rejecting the combinations that
+  don't have one, is the caller's job; getting it wrong is request smuggling.
+* **Field names are case-preserved.** Slices point into your buffer, so nothing is
+  lowercased. Compare case-insensitively: `Content-Length`, `content-length` and
+  `CONTENT-LENGTH` are all legal and an attacker picks which to send.
+* **Duplicate headers.** Returned once each, in order, unmerged and undeduplicated.
+* **Path normalization.** The target comes back as an opaque slice. hparse never
+  percent-decodes and never resolves `.` or `..`, so routing or access control on
+  the raw bytes is bypassable with `%2e%2e%2f`. Normalize before you match.
+  Rejecting `\` and raw non-ASCII (above) closes a *byte-level* divergence between
+  you and the origin; it is not a substitute for normalizing.
+* **Limits.** Header count is bounded only by the array you pass, which yields
+  `error.TooManyHeaders` when full. There is no cap on target length, field length
+  or total head size — bound those with your read buffer.
+
 ## Installation
 
 Install via Zig package manager (Copy the full SHA of latest commit hash from GitHub):

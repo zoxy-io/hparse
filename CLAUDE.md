@@ -9,6 +9,16 @@ Consumed by the zoxy proxy at ingress, which is the fact that decides most
 arguments: this parser sees bytes an attacker chose, in a segmentation an
 attacker chose, on a thread that is also serving other connections.
 
+The flip side of "nothing else" is a list of things the caller must therefore do
+itself, and it is enumerated in the README under **What hparse does not check** —
+framing, case-insensitive field-name comparison, duplicate headers, path
+normalization, limits. Keep it current: every time this parser declines to
+interpret something, that is not the end of the argument, it is an obligation
+moving to the consumer, and the only honest place to record it is where a
+consumer will read it. Most of `src/disagreements.zig` is that same boundary
+seen from the other side — llhttp refusing messages hparse passes through
+because llhttp does framing and hparse does not.
+
 ## Gates — run before every commit
 
 - `zig build test` — unit tests.
@@ -151,6 +161,23 @@ import was cheap, and the reason a corpus from any other parser would be too.
   smuggling starts: two intermediaries that disagree about where a line ends
   parse two different messages out of the same bytes. RFC 9112 §2.2 permits
   the leniency; a proxy-grade parser must not take it.
+- **The request-target is RFC 3986 `pchar` plus `/?%` and `#[]`, and that is a
+  routing decision.** `pchar` alone excludes the delimiters a target is built out
+  of, so the table is pchar, the structural `/`, `?` and the `%` of a pct-encoded
+  escape, and three tolerated characters. It refuses `"<>\^`{|}` and all of
+  0x80-0xff. The one that motivates it is
+  `\`: IIS, .NET and browser URL parsing normalize a backslash to `/`, so a
+  proxy routing on `/public\..\admin` and an origin resolving `/admin` have read
+  two paths out of one target. zoxy routes on paths, which is what makes this
+  hparse's problem rather than the caller's. Rejecting 0x80-0xff is the part
+  with a real cost — raw UTF-8 in a path is common in the wild and now 400s —
+  and it was chosen deliberately. `#`, `[` and `]` are tolerated against the
+  grammar: a fragment fails SAFE (an origin truncating there sees *less* path
+  than the proxy did), and brackets are everywhere in query strings.
+  **This does not make path routing safe on its own.** Percent-encoding and
+  dot-segments are the dominant confusions, hparse decodes neither, and a caller
+  matching on the target must still normalize first. What the table buys is that
+  the proxy and the origin cannot read *different bytes* as different paths.
 - **The header-key scan is scalar on purpose, and it is the fast one.**
   `matchHeaderKey` walks `key_map` a byte at a time while `matchPath` and
   `matchHeaderValue` vectorize. That looks like an oversight and is not. A field
