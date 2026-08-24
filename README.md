@@ -26,9 +26,9 @@ zig build bench -Druns=10      # more repetitions
 zig build bench -Diters=10000000  # heavier workload per run
 ```
 
-This builds and compares three parsers on the same request workload: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`) and **picohttpparser** (compiled from C by Zig's bundled clang).
+This builds and compares four parsers on the same request workload: **hparse**, **std.http** (`std.http.Server.Request.Head.parse`), **picohttpparser** and **llhttp** (both compiled from C by Zig's bundled clang).
 
-Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run:
+Current numbers on an Intel Core Ultra 7 258V (AVX2), Zig 0.16.0, 1M parses per run — predates llhttp joining the comparison, so it isn't in this snapshot:
 
 ```
 name                    min       mean        max      rel

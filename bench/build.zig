@@ -6,9 +6,9 @@ const std = @import("std");
 //   zig build bench -Druns=10       more repetitions per parser
 //   zig build                       just build the benchmark binaries into zig-out/bin
 //
-// Parsers compared: hparse, std.http.Server.Request.Head and picohttpparser. The C
-// parser is compiled with Zig's bundled clang, so no gcc or make is required — the
-// whole flow lives inside `zig build`, no shell or Makefile.
+// Parsers compared: hparse, std.http.Server.Request.Head, picohttpparser and
+// llhttp. The C parsers are compiled with Zig's bundled clang, so no gcc or make
+// is required — the whole flow lives inside `zig build`, no shell or Makefile.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Benchmarks are meaningless in Debug, so ReleaseFast is hardcoded rather than
@@ -83,10 +83,31 @@ pub fn build(b: *std.Build) void {
         .root_module = pico_mod,
     });
 
+    // llhttp benchmark: Zig driver + the vendored generated C parser, compiled
+    // the same way as picohttpparser above.
+    const llhttp_mod = b.createModule(.{
+        .root_source_file = b.path("llhttp/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "bench_options", .module = options_module }},
+    });
+    llhttp_mod.addIncludePath(b.path("llhttp"));
+    llhttp_mod.addCSourceFiles(.{
+        .files = &.{ "llhttp/api.c", "llhttp/http.c", "llhttp/llhttp.c" },
+        .flags = &.{"-O3"},
+    });
+    const llhttp_bench = b.addExecutable(.{
+        .name = "llhttp",
+        .use_llvm = true,
+        .root_module = llhttp_mod,
+    });
+
     // `zig build` installs the binaries so they can also be fed to poop directly.
     b.installArtifact(hparse_bench);
     b.installArtifact(headparser_bench);
     b.installArtifact(pico_bench);
+    b.installArtifact(llhttp_bench);
 
     // Pure-Zig timing runner (host tool).
     const runner = b.addExecutable(.{
@@ -106,6 +127,8 @@ pub fn build(b: *std.Build) void {
     run_bench.addArtifactArg(headparser_bench);
     run_bench.addArg("picohttpparser");
     run_bench.addArtifactArg(pico_bench);
+    run_bench.addArg("llhttp");
+    run_bench.addArtifactArg(llhttp_bench);
 
     const bench_step = b.step("bench", "Build all parsers and run the wall-clock comparison");
     bench_step.dependOn(&run_bench.step);
