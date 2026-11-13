@@ -70,7 +70,7 @@ pub const uses_vectors = use_vectors;
 pub const vector_size: usize = vec_size;
 
 /// `vec_size` as unsigned integer type.
-const VectorInt = std.meta.Int(.unsigned, vec_size);
+const VectorInt = @Int(.unsigned, vec_size);
 
 /// How many bytes `matchHeaderValue` scans scalar before it loads a vector chunk.
 ///
@@ -222,7 +222,7 @@ inline fn firstRejected(bad: @Vector(vec_size, bool)) usize {
         const Vec = @Vector(vec_size, u8);
         const Half = @Vector(vec_size / 2, u16);
         const Narrow = @Vector(vec_size / 2, u8);
-        const NibbleMask = std.meta.Int(.unsigned, vec_size * 4);
+        const NibbleMask = @Int(.unsigned, vec_size * 4);
 
         const bytes: Vec = @select(u8, bad, @as(Vec, @splat(0xff)), @as(Vec, @splat(0)));
         const nibbles: NibbleMask = @bitCast(@as(Narrow, @truncate(@as(Half, @bitCast(bytes)) >> @as(Half, @splat(4)))));
@@ -1107,7 +1107,7 @@ const Cursor = struct {
 /// Table of valid method characters — token (tchar) from RFC 9110 §5.6.2:
 /// letters, digits, and "!#$%&'*+-.^_`|~".
 const method_map: [256]u1 = blk: {
-    var map = [_]u1{0} ** 256;
+    var map: [256]u1 = @splat(0);
     for ("!#$%&'*+-.^_`|~") |c| map[c] = 1;
     for ('0'..'9' + 1) |c| map[c] = 1;
     for ('A'..'Z' + 1) |c| map[c] = 1;
@@ -1152,7 +1152,7 @@ inline fn isValidMethodChar(c: u8) bool {
 /// must still normalize before it matches. What the table buys is that the proxy and
 /// the origin cannot read *different bytes* as different paths.
 const path_map: [256]u1 = blk: {
-    var map = [_]u1{0} ** 256;
+    var map: [256]u1 = @splat(0);
     // unreserved
     for ('0'..'9' + 1) |c| map[c] = 1;
     for ('A'..'Z' + 1) |c| map[c] = 1;
@@ -1946,7 +1946,7 @@ test "parseRequest: a header key is exactly tchar, for every byte" {
     const tchar = "!#$%&'*+-.^_`|~0123456789" ++
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-    for ([_][]const u8{ "A", "A" ** 24 }) |pad| {
+    for ([_][]const u8{ "A", &@as([24]u8, @splat('A')) }) |pad| {
         for (0..256) |c| {
             const byte: u8 = @intCast(c);
 
@@ -1983,7 +1983,7 @@ test "parseRequest: a request-target is exactly pchar, for every byte" {
     const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" ++
         "-._~" ++ "!$&'()*+,;=" ++ ":@" ++ "/?%" ++ "#[]";
 
-    for ([_][]const u8{ "a", "a" ** 40 }) |pad| {
+    for ([_][]const u8{ "a", &@as([40]u8, @splat('a')) }) |pad| {
         for (0..256) |c| {
             const byte: u8 = @intCast(c);
 

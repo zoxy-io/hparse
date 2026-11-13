@@ -1,9 +1,9 @@
 { pkgs, ... }:
 
 {
-  # Zig 0.16.x toolchain — matches build.zig.zon and the CI workflows.
+  # Zig 0.17.x toolchain — matches build.zig.zon and the CI workflows.
   packages = [
-    pkgs.zig_0_16
+    pkgs.zig_0_17
   ];
 
   # Convenience wrappers. Named to avoid shadowing the `test`/`build` shell builtins.

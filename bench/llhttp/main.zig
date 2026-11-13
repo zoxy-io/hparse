@@ -16,7 +16,7 @@ const llhttp_t = extern struct {
     data: ?*anyopaque,
     _current: ?*anyopaque,
     content_length: u64,
-    @"type": u8,
+    type: u8,
     method: u8,
     http_major: u8,
     http_minor: u8,

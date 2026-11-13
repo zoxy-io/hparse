@@ -25,6 +25,18 @@
 //! waiting for a body the other three do not know about.
 
 const std = @import("std");
+
+/// `s` written out `n` times, at comptime. Zig 0.17 removed the `**` operator;
+/// `@splat` replaces it for one repeated element, but these patterns are
+/// several bytes long.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        return &final;
+    }
+}
 const Io = std.Io;
 const iters = @import("bench_options").iters;
 
@@ -57,7 +69,7 @@ const chrome =
 /// 127 bytes of request-target, the length the parser's own notes already quote
 /// for `matchPath` ("193-194 -> 88-89 on a 127-byte request-target"). Asserted
 /// rather than commented, because the comment is the part that rots.
-const long_target = "/" ++ ("abcdefghij/" ** 11) ++ "?q=12";
+const long_target = "/" ++ repeat("abcdefghij/", 11) ++ "?q=12";
 
 comptime {
     if (long_target.len != 127) @compileError("long_target must stay 127 bytes to match the recorded matchPath numbers");
@@ -65,7 +77,7 @@ comptime {
 
 /// 40 bytes of `token`, all of it tchar. Long enough that the scalar key loop's
 /// per-byte cost dominates the per-header overhead around it.
-const long_key = "X-" ++ ("Long-" ** 7) ++ "Key";
+const long_key = "X-" ++ repeat("Long-", 7) ++ "Key";
 
 comptime {
     if (long_key.len != 40) @compileError("long_key must stay 40 bytes");
@@ -73,7 +85,7 @@ comptime {
 
 /// 390 bytes of field-content, no OWS inside, so the value scan runs its vector
 /// loop about twelve times per header at 32 bytes wide.
-const long_value = "abcdefghijklmnopqrstuvwxyz0123456789-_." ** 10;
+const long_value = repeat("abcdefghijklmnopqrstuvwxyz0123456789-_.", 10);
 
 comptime {
     if (long_value.len != 390) @compileError("long_value must stay 390 bytes");
@@ -141,7 +153,7 @@ pub const all = [_]Workload{
     .{
         .name = "many-tiny",
         .request = "GET / HTTP/1.1\r\n" ++
-            ("A: b\r\n" ** 24) ++
+            repeat("A: b\r\n", 24) ++
             "\r\n",
         .loads = "per-header overhead: colon, OWS, CRLF, slice stores",
     },

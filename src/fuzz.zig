@@ -41,9 +41,7 @@ const hparse = @import("hparse");
 const scalar = @import("hparse_scalar");
 
 /// First reference parser; see `diffRequestAgainstPico`.
-const pico = @cImport({
-    @cInclude("picohttpparser.h");
-});
+const pico = @import("picohttpparser");
 
 /// Seed corpus harvested from llhttp's markdown test fixtures.
 const corpus_llhttp = @import("corpus_llhttp.zig");
@@ -52,9 +50,7 @@ const corpus_llhttp = @import("corpus_llhttp.zig");
 const disagreements = @import("disagreements.zig");
 
 /// Second reference parser; see `diffRequestAgainstLlhttp`.
-const llhttp = @cImport({
-    @cInclude("llhttp.h");
-});
+const llhttp = @import("llhttp");
 
 /// Fuzz inputs are capped at one page so a copy always fits in front of the guard page.
 const max_input = 1024;
@@ -486,8 +482,8 @@ const LlhttpRecord = struct {
     method: Span = .{},
     url: Span = .{},
     status: Span = .{},
-    keys: [max_headers]Span = [_]Span{.{}} ** max_headers,
-    values: [max_headers]Span = [_]Span{.{}} ** max_headers,
+    keys: [max_headers]Span = @splat(.{}),
+    values: [max_headers]Span = @splat(.{}),
     /// Counts every header llhttp reports, including any past `max_headers`, so a
     /// count that overruns the array shows up as a mismatch instead of being
     /// truncated into agreement.

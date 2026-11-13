@@ -83,9 +83,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
@@ -196,8 +194,15 @@ pub fn build(b: *std.Build) void {
         .root_module = pico_mod,
     });
 
-    fuzz_mod.addIncludePath(b.path("bench/picohttpparser"));
     fuzz_mod.linkLibrary(pico_lib);
+    // Its header, translated here rather than by `@cImport` in fuzz.zig: Zig
+    // 0.17 removed the builtin, and a translated module is what replaces it.
+    const pico_c = b.addTranslateC(.{
+        .root_source_file = b.path("bench/picohttpparser/picohttpparser.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_mod.addImport("picohttpparser", pico_c.createModule());
 
     // llhttp, as the second reference parser. Vendored for the benchmarks like
     // picohttpparser, and compiled as its own uninstrumented library for the same
@@ -222,14 +227,16 @@ pub fn build(b: *std.Build) void {
         .root_module = llhttp_mod,
     });
 
-    fuzz_mod.addIncludePath(b.path("bench/llhttp"));
     fuzz_mod.linkLibrary(llhttp_lib);
+    const llhttp_c = b.addTranslateC(.{
+        .root_source_file = b.path("bench/llhttp/llhttp.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_mod.addImport("llhttp", llhttp_c.createModule());
 
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_mod,
-        // Patched copy of the default test runner; the stock one fails to compile in
-        // fuzz mode (`-ffuzz`) on Zig 0.16.0. See the doc comment in the file.
-        .test_runner = .{ .path = b.path("src/fuzz_test_runner.zig"), .mode = .server },
         // The self-hosted x86_64 backend emits no fuzz coverage instrumentation (the
         // build runner's coverage thread panics on an empty PC table). It also
         // scalarizes @Vector code, and we want to fuzz the real SIMD paths.
