@@ -1,6 +1,6 @@
 # hparse
 
-A zero-allocation, streaming HTTP/1.x parser. Zig 0.16. It parses request
+A zero-allocation, streaming HTTP/1.x parser. Zig 0.17. It parses request
 and status lines and headers, and **nothing else** — no framing, no body, no
 connection state. Those decisions belong to the caller, which is why the whole
 of zoxy's framing lives behind `src/http/parser.zig` and not here.
@@ -26,12 +26,9 @@ because llhttp does framing and hparse does not.
   a couple of seconds, and **in CI**. It was not, once, and an accepted empty
   request-target survived for exactly that reason: the oracle that catches it
   already existed and was never executed.
-- `zig build fuzz --fuzz` — coverage-guided fuzzing. **This works here**,
-  because `src/fuzz_test_runner.zig` is a custom runner; the Zig 0.16.0
-  breakage that blocks it in other repos (`compiler/test_runner.zig:566`,
-  a StackTrace type mismatch under `-ffuzz`) does not apply. Run it for a few
-  minutes on any change to the parser — it has found real bugs in about two
-  minutes, twice.
+- `zig build fuzz --fuzz` — coverage-guided fuzzing, on Zig's stock test
+  runner. Run it for a few minutes on any change to the parser — it has found
+  real bugs in about two minutes, twice.
 - `zig build test -Duse-vectors=false` — the same unit tests against the
   scalar tier. Nothing else reaches it: `std.simd.suggestVectorLength` is
   non-null on every target this builds for (SSE2 on baseline x86_64, NEON on

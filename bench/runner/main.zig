@@ -216,7 +216,7 @@ fn printTable(workload: workloads.Workload, rows: []const [workload_count]Result
 
     std.debug.print("\n{s} — {s}, {d} bytes\n", .{ workload.name, workload.loads, workload.request.len });
     std.debug.print("{s:<16} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "name", "min", "mean", "max", "rel" });
-    std.debug.print("{s}\n", .{"-" ** 58});
+    std.debug.print("{s}\n", .{&@as([58]u8, @splat('-'))});
     for (shown) |res| {
         std.debug.print("{s:<16} {d:>7.1} ns {d:>7.1} ns {d:>7.1} ns {d:>7.2}x\n", .{
             res.name,

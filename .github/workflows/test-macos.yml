@@ -17,7 +17,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       # `--test-timeout 5m` raises the build runner's watchdog, and not because
       # any test here is slow — the unit tests are about 100ms of CPU. The
